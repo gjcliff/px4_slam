@@ -45,6 +45,7 @@ cd ~/repos/ws/src/
 git clone https://github.com/gjcliff/px4_slam.git
 cd ~/repos/ws/
 python -m venv .venv --system-site-packges
+touch .venv/COLCON_IGNORE
 source .venv/bin/activate
 pip install gtsam
 colcon build
