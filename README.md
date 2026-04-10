@@ -6,6 +6,7 @@ TODO: add gps
 
 got imu preintegration working with GTSAM:  
 ![video](https://github.com/user-attachments/assets/12989f19-69b0-449a-b3e2-be73838d3818)
+<iframe width="560" height="315" src="https://github.com/user-attachments/assets/12989f19-69b0-449a-b3e2-be73838d3818" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
 
 ## dev setup
 we are working with px4 v1.16
