@@ -101,12 +101,15 @@ class PX4Slam(Node):
             values = gtsam.Values()
 
             i = self.count
+
+            # create imu factor
             factor = gtsam.ImuFactor(
                 X(i), V(i), X(i + 1), V(i + 1), self.biasKey, self.pim
             )
             graph.add(factor)
 
-            result: gtsam.ISAM2Result = self.isam.calculateEstimate()
+            # grab current estimate
+            result = self.isam.calculateEstimate()
             prev_state = gtsam.NavState(result.atPose3(X(i)), result.atVector(V(i)))
             pred_state = self.pim.predict(
                 prev_state, result.atConstantBias(self.biasKey)
@@ -114,6 +117,7 @@ class PX4Slam(Node):
             values.insert(X(i + 1), pred_state.pose())
             values.insert(V(i + 1), pred_state.velocity())
 
+            # add bias factor periodically
             if self.count % 5 == 0 and self.count != 0:
                 graph.add(
                     gtsam.BetweenFactorConstantBias(
@@ -126,6 +130,7 @@ class PX4Slam(Node):
                 self.biasKey += 1
                 values.insert(self.biasKey, gtsam.imuBias.ConstantBias())
 
+            # optimize
             self.isam.update(graph, values)
             plot.plot_incremental_trajectory(
                 0, result, start=i, scale=3, time_interval=0.01
@@ -135,8 +140,6 @@ class PX4Slam(Node):
             self.pim.resetIntegration()
             self.prev_timestamp = msg.timestamp
             self.count += 1
-
-            # self.init_values.clear()
 
     def global_position_callback(self, msg: VehicleGlobalPosition): ...
 
