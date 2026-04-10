@@ -8,6 +8,7 @@
   <license>TODO: License declaration</license>
 
   <depend>gtsam</depend>
+  <depend>python3-gtsam</depend>
   <depend>message_filters</depend>
 
   <test_depend>ament_copyright</test_depend>
