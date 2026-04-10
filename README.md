@@ -7,8 +7,6 @@ TODO: add gps
 got imu preintegration working with GTSAM:  
 <video src="https://github.com/user-attachments/assets/fb532ecd-b079-43d2-b6e3-8577174a553a"></video>
 
-
-
 ## dev setup
 we are working with px4 v1.16
 
@@ -35,12 +33,20 @@ colcon build # takes ~3 min
 ```
 
 ### setup this project
+this virtual environment trick only works because i added:
+```bash
+[build_scripts]
+executable = /usr/bin/env python3
+```
+to the setup.cfg file
+
 ```bash
 cd ~/repos/ws/src/  
 git clone https://github.com/gjcliff/px4_slam.git
-cd px4_slam
-pip install -r requirements.txt
 cd ~/repos/ws/
+python -m venv .venv --system-site-packges
+source .venv/bin/activate
+pip install gtsam
 colcon build
 ```
 
