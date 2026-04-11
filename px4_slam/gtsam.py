@@ -40,11 +40,10 @@ class PX4Slam(Node):
             self.imu_callback,
             qos_profile=qos_profile_sensor_data,
         )
-        # NO. USE GPSMSG
-        self._global_position_sub: rclpy.node.Subscription = self.create_subscription(
+        self._gps_sub: rclpy.node.Subscription = self.create_subscription(
             SensorGps,
             "/fmu/out/sensor_gps",
-            self.global_position_callback,
+            self.gps_callback,
             qos_profile=qos_profile_sensor_data,
         )
         self._magnetometer_sub: rclpy.node.Subscription = self.create_subscription(
@@ -253,7 +252,7 @@ class PX4Slam(Node):
             self.prev_timestamp = msg.timestamp
             self.count += 1
 
-    def global_position_callback(self, msg: SensorGps):
+    def gps_callback(self, msg: SensorGps):
         self.latest_gps_msg = msg
 
     def magnetometer_callback(self, msg: VehicleMagnetometer):
