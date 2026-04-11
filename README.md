@@ -6,7 +6,7 @@ TODO: add camera
 ~TODO: add instructions~  
 
 State estimation with GPS, IMU, and magnetometer
-[![Watch the video](https://img.youtube.com/vi/GlxBOd4CTmQ/maxresdefault.jpg)](https://youtu.be/GlxBOd4CTmQ)
+[![Watch the video](https://img.youtube.com/vi/rOaBWvPd-hU/maxresdefault.jpg)](https://youtu.be/GlxBOd4CTmQ)
 
 ## dev setup
 we are working with px4 v1.16
