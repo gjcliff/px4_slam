@@ -1,7 +1,7 @@
 import gtsam
 import numpy as np
 import rclpy
-from gtsam.symbol_shorthand import B, V, X
+from gtsam.symbol_shorthand import B, G, V, X
 from gtsam.utils import plot
 from px4_msgs.msg import SensorCombined, VehicleGlobalPosition
 from rclpy.node import Node
@@ -9,7 +9,12 @@ from rclpy.qos import qos_profile_sensor_data
 
 
 class PX4Slam(Node):
-    isam: gtsam.ISAM2
+    biasKey: int
+    biasNoise: gtsam.noiseModel.Isotropic
+    gpsKey: int
+    gpsNoise: gtsam.noiseModel.Isotropic
+    pim: gtsam.PreintegratedImuMeasurements
+    latest_gps_msg: VehicleGlobalPosition | None
 
     def __init__(self):
         super().__init__("px4_slam")
@@ -22,19 +27,39 @@ class PX4Slam(Node):
         )
         self._global_position_sub: rclpy.node.Subscription = self.create_subscription(
             VehicleGlobalPosition,
-            "/px4_1/fmu/out/vehicle_global_position",
+            "/fmu/out/vehicle_global_position",
             self.global_position_callback,
             qos_profile=qos_profile_sensor_data,
         )
 
+        self.latest_gps_msg = None
         self.prev_timestamp = None
         self.count = 0
 
-        self.isam = gtsam.ISAM2(gtsam.ISAM2Params())
+        self.isam: gtsam.ISAM2 = gtsam.ISAM2(gtsam.ISAM2Params())
         init_graph = gtsam.NonlinearFactorGraph()
         init_values = gtsam.Values()
 
-        # initial pose factor
+        init_graph, init_values = self.set_priors(graph=init_graph, values=init_values)
+
+        init_graph, init_values = self.setup_imu_factors(
+            graph=init_graph, values=init_values
+        )
+        self.gpsKey = G(0)
+
+        self.isam.update(init_graph, init_values)
+
+    def add_gps_factor(
+        self,
+        graph: gtsam.NonlinearFactorGraph,
+        key: int,
+        msg: VehicleGlobalPosition
+    ):
+        self.gpsNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
+        gps = gtsam.Point3(msg.lat, msg.lon, msg.alt)
+        graph.add(gtsam.GPSFactor(key, gps, self.gpsNoise))
+
+    def set_priors(self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values):
         priorNoise = gtsam.noiseModel.Diagonal.Sigmas(
             np.array([0.1, 0.1, 0.1, 0.3, 0.3, 0.3])
         )
@@ -48,35 +73,37 @@ class PX4Slam(Node):
                 ]
             )
         )
-        self.prev_pose = initial_pose
-        init_graph.push_back(gtsam.PriorFactorPose3(X(0), initial_pose, priorNoise))
-        init_values.insert(X(0), initial_pose)
+        graph.push_back(gtsam.PriorFactorPose3(X(0), initial_pose, priorNoise))
+        values.insert(X(0), initial_pose)
 
-        # initial velocity factor
         initial_velocity = gtsam.Point3(np.array([0.0, 0.0, 0.0]))
         velNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
-        init_graph.push_back(gtsam.PriorFactorVector(V(0), initial_velocity, velNoise))
-        init_values.insert(V(0), initial_velocity)
-        self.prev_vel = initial_velocity
+        graph.push_back(gtsam.PriorFactorVector(V(0), initial_velocity, velNoise))
+        values.insert(V(0), initial_velocity)
 
+        return graph, values
+
+    def setup_imu_factors(
+        self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values
+    ):
         self.biasKey = B(0)
         self.biasNoise = gtsam.noiseModel.Isotropic.Sigma(6, 0.1)
-        init_graph.push_back(
+        graph.push_back(
             gtsam.PriorFactorConstantBias(
                 self.biasKey, gtsam.imuBias.ConstantBias(), self.biasNoise
             )
         )
-        init_values.insert(self.biasKey, gtsam.imuBias.ConstantBias())
-
-        self.isam.update(init_graph, init_values)
+        values.insert(self.biasKey, gtsam.imuBias.ConstantBias())
 
         # define the preintegratedimumeasurements object here
         pim_params = self.preintegration_parameters()
         self.pim = gtsam.PreintegratedImuMeasurements(pim_params)
 
+        return graph, values
+
     def preintegration_parameters(self):
         params = gtsam.PreintegrationParams.MakeSharedD(9.81)
-        I = np.eye(3)
+        I = np.eye(3)  # noqa: E741
         params.setAccelerometerCovariance(I * 0.1)
         params.setGyroscopeCovariance(I * 0.1)
         params.setIntegrationCovariance(I * 0.1)
@@ -108,6 +135,11 @@ class PX4Slam(Node):
             )
             graph.add(factor)
 
+            if self.latest_gps_msg is not None:
+                self.add_gps_factor(graph, X(i+1), self.latest_gps_msg)
+                self.gpsKey += 1
+                self.latest_gps_msg = None
+
             # grab current estimate
             result = self.isam.calculateEstimate()
             prev_state = gtsam.NavState(result.atPose3(X(i)), result.atVector(V(i)))
@@ -135,14 +167,15 @@ class PX4Slam(Node):
             plot.plot_incremental_trajectory(
                 0, result, start=i, scale=3, time_interval=0.01
             )
-            self.get_logger().info(f"result: {result}")
+            if self.count % 10 == 0:
+                self.get_logger().info(result.atPose3(X(i)).__repr__())
 
             self.pim.resetIntegration()
             self.prev_timestamp = msg.timestamp
             self.count += 1
 
-    def global_position_callback(self, msg: VehicleGlobalPosition): ...
-
+    def global_position_callback(self, msg: VehicleGlobalPosition):
+        self.latest_gps_msg = msg
 
 def main(args=None):
     rclpy.init(args=args)
