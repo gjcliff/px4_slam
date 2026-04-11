@@ -12,13 +12,13 @@ class PX4Slam(Node):
     biasKey: int
     biasNoise: gtsam.noiseModel.Isotropic
     pim: gtsam.PreintegratedImuMeasurements
-    latest_gps_msg: SensorGps | None
-    latest_mag_msg: VehicleMagnetometer | None
-    ref_sin_lat = float | None  # also used as init sentinel
-    ref_cos_lat = float | None
-    ref_lat = float | None
-    ref_lon = float | None
-    origin_alt = float | None
+    latest_gps_msg: SensorGps | None = None
+    latest_mag_msg: VehicleMagnetometer | None = None
+    prev_timestamp: int | None = None
+    count: int = 0
+    ref_lat: float = 0.0
+    ref_lon: float = 0.0
+    ref_alt: float = 0.0
 
     def __init__(self):
         super().__init__("px4_slam")
@@ -27,12 +27,6 @@ class PX4Slam(Node):
         rr.log("world", rr.ViewCoordinates.FRD, static=True)
         rr.log("world/drone", rr.TransformAxes3D(axis_length=1.0), static=True)
         self.trajectory: list[list[float]] = []
-
-        self.ref_sin_lat = None
-        self.ref_cos_lat = None
-        self.ref_lat = None
-        self.ref_lon = None
-        self.origin_alt = None
 
         self._imu_sub: rclpy.node.Subscription = self.create_subscription(
             SensorCombined,
@@ -53,38 +47,33 @@ class PX4Slam(Node):
             qos_profile=qos_profile_sensor_data,
         )
 
-        self.latest_gps_msg = None
-        self.latest_mag_msg = None
-        self.prev_timestamp = None
-        self.count = 0
+        parameters = gtsam.ISAM2Params()
+        parameters.setRelinearizeThreshold(0.01)
+        parameters.relinearizeSkip = 1
+        self.isam: gtsam.ISAM2 = gtsam.ISAM2(parameters)
 
-        self.isam: gtsam.ISAM2 = gtsam.ISAM2(gtsam.ISAM2Params())
         init_graph = gtsam.NonlinearFactorGraph()
         init_values = gtsam.Values()
-
         init_graph, init_values = self.set_priors(graph=init_graph, values=init_values)
-
         init_graph, init_values = self.setup_imu_factors(
             graph=init_graph, values=init_values
         )
-
         self.isam.update(init_graph, init_values)
 
     def init_reference(self, lat_0, lon_0, alt_0):
-        self.origin_alt = alt_0
+        self.ref_alt = alt_0
         self.ref_lat = np.radians(lat_0)
         self.ref_lon = np.radians(lon_0)
-        self.ref_sin_lat = np.sin(self.ref_lat)
-        self.ref_cos_lat = np.cos(self.ref_lat)
 
-    def project(self, lat, lon):
+    def project(self, lat: float, lon: float):
+        assert self.ref_lat is not None
         lat_rad = np.radians(lat)
         lon_rad = np.radians(lon)
         sin_lat = np.sin(lat_rad)
         cos_lat = np.cos(lat_rad)
         cos_d_lon = np.cos(lon_rad - self.ref_lon)
         arg = np.clip(
-            self.ref_sin_lat * sin_lat + self.ref_cos_lat * cos_lat * cos_d_lon,
+            np.sin(self.ref_lat) * sin_lat + np.cos(self.ref_lat) * cos_lat * cos_d_lon,
             -1.0,
             1.0,
         )
@@ -92,7 +81,7 @@ class PX4Slam(Node):
         k = c / np.sin(c) if abs(c) > 0 else 1.0
         north = (
             k
-            * (self.ref_cos_lat * sin_lat - self.ref_sin_lat * cos_lat * cos_d_lon)
+            * (np.cos(self.ref_lat) * sin_lat - np.sin(self.ref_lat) * cos_lat * cos_d_lon)
             * 6371000
         )
         east = k * cos_lat * np.sin(lon_rad - self.ref_lon) * 6371000
@@ -101,10 +90,10 @@ class PX4Slam(Node):
     def add_gps_factor(
         self, graph: gtsam.NonlinearFactorGraph, key: int, msg: SensorGps
     ):
-        if self.ref_sin_lat is None:
+        if self.ref_lat is None:
             self.init_reference(msg.latitude_deg, msg.longitude_deg, msg.altitude_msl_m)
         north, east = self.project(msg.latitude_deg, msg.longitude_deg)
-        down = -(msg.altitude_msl_m - self.origin_alt)
+        down = -(msg.altitude_msl_m - self.ref_alt)
         gps = gtsam.Point3(north, east, down)
         gpsNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
         graph.add(gtsam.GPSFactor(key, gps, gpsNoise))
@@ -142,6 +131,15 @@ class PX4Slam(Node):
         graph.push_back(gtsam.PriorFactorVector(V(0), initial_velocity, velNoise))
         values.insert(V(0), initial_velocity)
         return graph, values
+
+    def setup_visual_factors(
+        self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values
+    ):
+        K = gtsam.Cal3_S2(50.0, 50.0, 0.0, 50.0, 50.0)
+
+        measurement_noise = gtsam.noiseModel.Isotropic.Sigma(
+            2, 1.0
+        )  # one pixel in u and v
 
     def setup_imu_factors(
         self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values
@@ -205,12 +203,6 @@ class PX4Slam(Node):
 
             i = self.count
 
-            # create imu factor
-            factor = gtsam.ImuFactor(
-                X(i), V(i), X(i + 1), V(i + 1), self.biasKey, self.pim
-            )
-            graph.add(factor)
-
             if self.latest_gps_msg is not None:
                 self.add_gps_factor(graph, X(i + 1), self.latest_gps_msg)
                 self.latest_gps_msg = None
@@ -227,6 +219,12 @@ class PX4Slam(Node):
             pred_state = self.pim.predict(prev_state, bias)
             values.insert(X(i + 1), pred_state.pose())
             values.insert(V(i + 1), pred_state.velocity())
+
+            # create imu factor
+            factor = gtsam.ImuFactor(
+                X(i), V(i), X(i + 1), V(i + 1), self.biasKey, self.pim
+            )
+            graph.add(factor)
 
             # add bias factor periodically
             if self.count % 5 == 0 and self.count != 0:
