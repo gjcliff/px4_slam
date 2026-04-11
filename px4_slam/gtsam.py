@@ -2,9 +2,8 @@ import gtsam
 import numpy as np
 import rclpy
 import rerun as rr
-from gtsam.symbol_shorthand import B, G, V, X
-from px4_msgs.msg import SensorCombined, VehicleGlobalPosition
-from pyproj import Transformer
+from gtsam.symbol_shorthand import B, V, X
+from px4_msgs.msg import SensorCombined, SensorGps, VehicleMagnetometer
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
@@ -12,10 +11,9 @@ from rclpy.qos import qos_profile_sensor_data
 class PX4Slam(Node):
     biasKey: int
     biasNoise: gtsam.noiseModel.Isotropic
-    gpsKey: int
-    gpsNoise: gtsam.noiseModel.Isotropic
     pim: gtsam.PreintegratedImuMeasurements
-    latest_gps_msg: VehicleGlobalPosition | None
+    latest_gps_msg: SensorGps | None
+    latest_mag_msg: VehicleMagnetometer | None
     ref_sin_lat = float | None  # also used as init sentinel
     ref_cos_lat = float | None
     ref_lat = float | None
@@ -24,10 +22,8 @@ class PX4Slam(Node):
 
     def __init__(self):
         super().__init__("px4_slam")
-
         rr.init("rerun_gtsam")
         rr.spawn()
-
         rr.log("world", rr.ViewCoordinates.FRD, static=True)
         rr.log("world/drone", rr.TransformAxes3D(axis_length=1.0), static=True)
         self.trajectory: list[list[float]] = []
@@ -38,24 +34,28 @@ class PX4Slam(Node):
         self.ref_lon = None
         self.origin_alt = None
 
-        self.transformer: Transformer = Transformer.from_crs(
-            "epsg:4326", "epsg:4978", always_xy=True
-        )
-
         self._imu_sub: rclpy.node.Subscription = self.create_subscription(
             SensorCombined,
             "/fmu/out/sensor_combined",
             self.imu_callback,
             qos_profile=qos_profile_sensor_data,
         )
+        # NO. USE GPSMSG
         self._global_position_sub: rclpy.node.Subscription = self.create_subscription(
-            VehicleGlobalPosition,
-            "/fmu/out/vehicle_global_position",
+            SensorGps,
+            "/fmu/out/sensor_gps",
             self.global_position_callback,
+            qos_profile=qos_profile_sensor_data,
+        )
+        self._magnetometer_sub: rclpy.node.Subscription = self.create_subscription(
+            VehicleMagnetometer,
+            "/fmu/out/vehicle_magnetometer",
+            self.magnetometer_callback,
             qos_profile=qos_profile_sensor_data,
         )
 
         self.latest_gps_msg = None
+        self.latest_mag_msg = None
         self.prev_timestamp = None
         self.count = 0
 
@@ -68,7 +68,6 @@ class PX4Slam(Node):
         init_graph, init_values = self.setup_imu_factors(
             graph=init_graph, values=init_values
         )
-        self.gpsKey = G(0)
 
         self.isam.update(init_graph, init_values)
 
@@ -85,22 +84,43 @@ class PX4Slam(Node):
         sin_lat = np.sin(lat_rad)
         cos_lat = np.cos(lat_rad)
         cos_d_lon = np.cos(lon_rad - self.ref_lon)
-        arg = np.clip(self.ref_sin_lat * sin_lat + self.ref_cos_lat * cos_lat * cos_d_lon, -1.0, 1.0)
+        arg = np.clip(
+            self.ref_sin_lat * sin_lat + self.ref_cos_lat * cos_lat * cos_d_lon,
+            -1.0,
+            1.0,
+        )
         c = np.arccos(arg)
         k = c / np.sin(c) if abs(c) > 0 else 1.0
-        north = k * (self.ref_cos_lat * sin_lat - self.ref_sin_lat * cos_lat * cos_d_lon) * 6371000
-        east  = k * cos_lat * np.sin(lon_rad - self.ref_lon) * 6371000
+        north = (
+            k
+            * (self.ref_cos_lat * sin_lat - self.ref_sin_lat * cos_lat * cos_d_lon)
+            * 6371000
+        )
+        east = k * cos_lat * np.sin(lon_rad - self.ref_lon) * 6371000
         return north, east
 
-    def add_gps_factor(self, graph, key, msg):
+    def add_gps_factor(
+        self, graph: gtsam.NonlinearFactorGraph, key: int, msg: SensorGps
+    ):
         if self.ref_sin_lat is None:
-            self.init_reference(msg.lat, msg.lon, msg.alt)
-
-        north, east = self.project(msg.lat, msg.lon)
-        down = -(msg.alt - self.origin_alt)
+            self.init_reference(msg.latitude_deg, msg.longitude_deg, msg.altitude_msl_m)
+        north, east = self.project(msg.latitude_deg, msg.longitude_deg)
+        down = -(msg.altitude_msl_m - self.origin_alt)
         gps = gtsam.Point3(north, east, down)
-        self.gpsNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
-        graph.add(gtsam.GPSFactor(key, gps, self.gpsNoise))
+        gpsNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
+        graph.add(gtsam.GPSFactor(key, gps, gpsNoise))
+
+    def add_mag_factor(
+        self, graph: gtsam.NonlinearFactorGraph, key: int, msg: VehicleMagnetometer
+    ):
+        self.magNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
+        yaw = np.arctan2(-msg.magnetometer_ga[1], msg.magnetometer_ga[0])
+        rot = gtsam.Rot3.Yaw(yaw)
+        pose = gtsam.Pose3(rot, gtsam.Point3(0, 0, 0))
+        mag_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.1, 0.1, 0.1, 1e6, 1e6, 1e6])
+        )
+        graph.add(gtsam.PriorFactorPose3(key, pose, mag_noise))
 
     def set_priors(self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values):
         priorNoise = gtsam.noiseModel.Diagonal.Sigmas(
@@ -118,12 +138,10 @@ class PX4Slam(Node):
         )
         graph.push_back(gtsam.PriorFactorPose3(X(0), initial_pose, priorNoise))
         values.insert(X(0), initial_pose)
-
         initial_velocity = gtsam.Point3(np.array([0.0, 0.0, 0.0]))
         velNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
         graph.push_back(gtsam.PriorFactorVector(V(0), initial_velocity, velNoise))
         values.insert(V(0), initial_velocity)
-
         return graph, values
 
     def setup_imu_factors(
@@ -137,11 +155,9 @@ class PX4Slam(Node):
             )
         )
         values.insert(self.biasKey, gtsam.imuBias.ConstantBias())
-
         # define the preintegratedimumeasurements object here
         pim_params = self.preintegration_parameters()
         self.pim = gtsam.PreintegratedImuMeasurements(pim_params)
-
         return graph, values
 
     def preintegration_parameters(self):
@@ -158,7 +174,6 @@ class PX4Slam(Node):
         t = pose.translation()
         q = pose.rotation().toQuaternion()
         rr.set_time("keyframe", sequence=self.count)
-
         rr.log(
             "world/drone",
             rr.Transform3D(
@@ -166,7 +181,6 @@ class PX4Slam(Node):
                 rotation=rr.Quaternion(xyzw=[q.x(), q.y(), q.z(), q.w()]),
             ),
         )
-
         # accumulate and redraw the full path
         self.trajectory.append([t[0], t[1], t[2]])
         rr.log(
@@ -200,8 +214,11 @@ class PX4Slam(Node):
 
             if self.latest_gps_msg is not None:
                 self.add_gps_factor(graph, X(i + 1), self.latest_gps_msg)
-                self.gpsKey += 1
                 self.latest_gps_msg = None
+
+            if self.latest_mag_msg is not None:
+                self.add_mag_factor(graph, X(i + 1), self.latest_mag_msg)
+                self.latest_mag_msg = None
 
             # grab current estimate
             pose = self.isam.calculateEstimatePose3(X(i))
@@ -232,17 +249,15 @@ class PX4Slam(Node):
             if self.count % 10 == 0:
                 self.get_logger().info(str(pose))
 
-            # self.log_pose(result.atPose3(X(i))
             self.pim.resetIntegration()
             self.prev_timestamp = msg.timestamp
             self.count += 1
 
-            # result = self.isam.calculateEstimate()
-            # result.print()
-            # self.isam.getFactorsUnsafe().print()
-
-    def global_position_callback(self, msg: VehicleGlobalPosition):
+    def global_position_callback(self, msg: SensorGps):
         self.latest_gps_msg = msg
+
+    def magnetometer_callback(self, msg: VehicleMagnetometer):
+        self.latest_mag_msg = msg
 
 
 def main(args=None):
