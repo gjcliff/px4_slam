@@ -47,7 +47,7 @@ cd ~/repos/ws/
 python -m venv .venv --system-site-packges
 touch .venv/COLCON_IGNORE
 source .venv/bin/activate
-pip install gtsam
+pip install -r src/px4_slam/requirements.txt
 colcon build
 ```
 
