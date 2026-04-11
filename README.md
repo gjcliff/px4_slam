@@ -5,7 +5,7 @@ TODO: add camera
 TODO: add gps  
 
 got imu preintegration working with GTSAM:  
-<video src="https://github.com/user-attachments/assets/fb532ecd-b079-43d2-b6e3-8577174a553a"></video>
+<video src="https://github.com/user-attachments/assets/969a2dfb-3be5-4c9c-9837-379c456c3cb1"></video>
 
 ## dev setup
 we are working with px4 v1.16
