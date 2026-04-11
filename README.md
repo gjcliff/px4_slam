@@ -1,10 +1,11 @@
 # PX4 SLAM with GTSAM
 
-~TODO: add instructions~  
 TODO: add camera  
-TODO: add gps  
+~TODO: add magnetometer~  
+~TODO: add gps~  
+~TODO: add instructions~  
 
-got imu preintegration working with GTSAM:  
+State estimation with GPS, IMU, and magnetometer
 [![Watch the video](https://img.youtube.com/vi/GlxBOd4CTmQ/maxresdefault.jpg)](https://youtu.be/GlxBOd4CTmQ)
 
 ## dev setup
@@ -63,7 +64,16 @@ bash ./PX4-Autopilot/Tools/setup/ubuntu.sh
 sudo reboot
 ```
 
-after reboot, go back and build
+add these topics to ```PX4-Autopilot/src/modules/uxrce-dds-client/dds_topics.yaml```:
+```bash
+  - topic: /fmu/out/sensor_gps
+    type: px4_msgs::msg::SensorGps
+
+  - topic: /fmu/out/vehicle_magnetometer
+    type: px4_msgs::msg::VehicleMagnetometer
+```
+
+build
 ```bash
 cd ~/repos/PX4-Autopilot
 make px4_sitl
@@ -71,7 +81,7 @@ make px4_sitl
 
 install uxrce-dds-bridge
 ```bash
-sudo snap install micro-xrce-dds-agent --edge # specifically this version
+sudo snap install micro-xrce-dds-agent --edge # specifically this version, if via snap
 ```
 
 ### running everything
