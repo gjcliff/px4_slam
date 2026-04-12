@@ -8,6 +8,9 @@ TODO: add camera
 State estimation with GPS, IMU, and magnetometer
 [![Watch the video](https://img.youtube.com/vi/rOaBWvPd-hU/maxresdefault.jpg)](https://youtu.be/rOaBWvPd-hU)
 
+SuperFlow: Barebone SLAM Frontend with SuperPoint and OpticalFlow:
+[![Watch the video](https://img.youtube.com/vi/RQ9UBKWL5aE/maxresdefault.jpg)](https://youtu.be/RQ9UBKWL5aE)
+
 ## dev setup
 we are working with px4 v1.16
 
