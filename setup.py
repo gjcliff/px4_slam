@@ -29,7 +29,6 @@ setup(
         "console_scripts": [
             "gtsam = px4_slam.gtsam:main",
             "match_points = px4_slam.match_points:main",
-            "gtsam_state_estimation = px4_slam.gtsam_state_estimation:main",
         ],
     },
 )
