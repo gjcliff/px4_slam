@@ -2,8 +2,12 @@ from launch_ros.actions import Node
 
 from launch import LaunchDescription
 
+import time
+
 
 def generate_launch_description():
+    recording_id = str(int(time.time()))  # same for all nodes in this launch
+
     return LaunchDescription(
         [
             Node(
@@ -11,12 +15,14 @@ def generate_launch_description():
                 namespace="",
                 executable="gtsam",
                 name="state_estimation",
+                parameters = [{"recording_id": recording_id}]
             ),
             Node(
                 package="px4_slam",
                 namespace="",
                 executable="super_flow",
                 name="super_flow",
+                parameters = [{"recording_id": recording_id}]
             ),
             Node(
                 package="ros_gz_bridge",

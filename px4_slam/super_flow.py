@@ -1,3 +1,6 @@
+import time
+from typing import Any, cast
+
 import cv2
 import numpy as np
 import rclpy
@@ -15,7 +18,7 @@ torch.set_grad_enabled(False)
 torch.set_float32_matmul_precision("high")
 
 
-class MatchPoints(Node):
+class SuperFlow(Node):
     latest_image_msg: Image | None
     latest_camera_info_msg: CameraInfo | None
     latest_pose: PoseStamped | None = None
@@ -30,19 +33,16 @@ class MatchPoints(Node):
     ref_lon: float | None = None
     ref_alt: float | None = None
 
-    # self.keyframe_db.append(
-    #     {
-    #         "keyframe_id": i,
-    #         "pose": pose,
-    #         "gps": (north, east, down),
-    #     }
-    # )
-
     def __init__(self):
-        super().__init__("match_points")
-        rr.init("match_points")
-        rr.spawn()
-        rr.log("world", rr.ViewCoordinates.FRD, static=True)
+        super().__init__("super_flow")
+
+        self.declare_parameter("recording_id", str(int(time.time())))
+        recording_id = (
+            self.get_parameter("recording_id").get_parameter_value().string_value
+        )
+
+        rr.init("super_flow", recording_id=recording_id)
+        rr.connect_grpc()
 
         self._matched_points_pub: rclpy.node.Publisher = self.create_publisher(
             MatchedPoints, "camera/matched_points", qos_profile_sensor_data
@@ -83,7 +83,7 @@ class MatchPoints(Node):
         self.max_history_len: int = 10  # max track history for viz
 
         # lk optical flow params
-        self.lk_params = dict(
+        self.lk_params: dict[str, Any] = dict(
             winSize=(31, 31),
             maxLevel=4,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
@@ -278,6 +278,9 @@ class MatchPoints(Node):
             return
         north, east = self.project(gps_msg.latitude_deg, gps_msg.longitude_deg)
         down = -(gps_msg.altitude_msl_m - self.ref_alt)
+        assert self.latest_image_msg is not None
+        img = self.ros_image_to_numpy(self.latest_image_msg)
+        img_small = cv2.resize(img, (320, 240))
         self.keyframe_db.append(
             {
                 "keyframe_id": keyframe_id,
@@ -285,6 +288,7 @@ class MatchPoints(Node):
                 "pose": pose,
                 "descriptors": descriptors,  # (K, 256) for current matched points
                 "pts": pts,  # (K, 2) pixel coordinates
+                "image": img_small,
             }
         )
         self.get_logger().info(
@@ -297,7 +301,7 @@ class MatchPoints(Node):
         radius: float = 5.0,
         max_yaw_diff: float = np.radians(45),
     ) -> list[dict]:
-        if len(self.keyframe_db) < 50:
+        if len(self.keyframe_db) < 20:
             self.get_logger().info(
                 f"loop closure: not enough keyframes yet ({len(self.keyframe_db)}/50)"
             )
@@ -397,12 +401,24 @@ class MatchPoints(Node):
             return
 
         # track with lk optical flow
-        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(  # ty: ignore
-            self.prev_gray, gray, self.prev_pts, None, **self.lk_params
+        assert self.prev_pts is not None
+        result = cast(
+            tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+            cv2.calcOpticalFlowPyrLK(  # ty: ignore
+                self.prev_gray, gray, self.prev_pts, None, **self.lk_params
+            ),
         )
+        curr_pts: np.ndarray | None = result[0] if result is not None else None
+        status: np.ndarray | None = result[1] if result is not None else None
+
+        if curr_pts is None or status is None:
+            self.get_logger().warn("optical flow failed, triggering redetection")
+            self.prev_gray = None  # force redetection next frame
+            self.frame_count += 1
+            return
 
         good_mask = status.ravel() == 1
-        pts0 = self.prev_pts[good_mask].reshape(-1, 2)  # ty: ignore
+        pts0 = self.prev_pts[good_mask].reshape(-1, 2)
         pts1 = curr_pts[good_mask].reshape(-1, 2)
         track_ids = [tid for tid, ok in zip(self.track_ids, good_mask) if ok]
 
@@ -469,10 +485,14 @@ class MatchPoints(Node):
             msg_out = MatchedPoints()
             msg_out.header.stamp = self.get_clock().now().to_msg()
             msg_out.keyframe_id = self.count
-            msg_out.points0_x = mature_pts0[:, 0].tolist()
-            msg_out.points0_y = mature_pts0[:, 1].tolist()
-            msg_out.points1_x = mature_pts1[:, 0].tolist()
-            msg_out.points1_y = mature_pts1[:, 1].tolist()
+            msg_out.points_x = mature_pts1[:, 0].tolist()
+            msg_out.points_y = mature_pts1[:, 1].tolist()
+            if mature_descs is not None:
+                msg_out.descriptors = mature_descs.flatten().tolist()
+            # msg_out.points0_x = mature_pts0[:, 0].tolist()
+            # msg_out.points0_y = mature_pts0[:, 1].tolist()
+            # msg_out.points1_x = mature_pts1[:, 0].tolist()
+            # msg_out.points1_y = mature_pts1[:, 1].tolist()
             msg_out.track_ids = mature_ids
             self._matched_points_pub.publish(msg_out)
 
@@ -536,6 +556,51 @@ class MatchPoints(Node):
                         self.get_logger().info(
                             f"lost tracks: {len(self.lost_track_descriptors)}, reassociated: ..."
                         )
+                        # get current and past pose positions
+                        curr_pos = [
+                            self.latest_pose.pose.position.x,
+                            self.latest_pose.pose.position.y,
+                            self.latest_pose.pose.position.z,
+                        ]
+                        past_pos = [
+                            candidate["pose"].position.x,
+                            candidate["pose"].position.y,
+                            candidate["pose"].position.z,
+                        ]
+                        rr.set_time("keyframe", sequence=self.count)
+                        rr.log(
+                            f"world/loop_closures/{self.count}",
+                            rr.LineStrips3D(
+                                [[curr_pos, past_pos]], colors=[[255, 100, 0]]
+                            ),
+                        )
+                        assert self.latest_image_msg is not None
+                        img_curr_np = self.ros_image_to_numpy(
+                            self.latest_image_msg
+                        ).copy()
+                        img_past_np = candidate["image"].copy()
+
+                        for pt in pts_curr:  # ty: ignore
+                            cv2.circle(
+                                img_curr_np,
+                                (int(pt[0]), int(pt[1])),
+                                4,
+                                (0, 255, 0),
+                                -1,
+                            )
+
+                        for pt in pts_past:  # ty: ignore
+                            cv2.circle(
+                                img_past_np,
+                                (int(pt[0]), int(pt[1])),
+                                4,
+                                (0, 255, 0),
+                                -1,
+                            )
+
+                        rr.set_time("keyframe", sequence=self.count)
+                        rr.log("loop_closure/current_image", rr.Image(img_curr_np))
+                        rr.log("loop_closure/past_image", rr.Image(img_past_np))
                         break
 
         # update track history for visualization
@@ -567,7 +632,7 @@ class MatchPoints(Node):
                 1,
             )
 
-        rr.set_time("frame", sequence=self.frame_count)
+        rr.set_time("keyframe", sequence=self.frame_count)
         rr.log("camera/tracks", rr.Image(img_curr), static=True)
 
         # self.get_logger().info(
@@ -594,9 +659,9 @@ class MatchPoints(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MatchPoints()
-    rclpy.spin(node)
-    node.destroy_node()
+    super_flow = SuperFlow()
+    rclpy.spin(super_flow)
+    super_flow.destroy_node()
     rclpy.shutdown()
 
 

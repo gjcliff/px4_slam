@@ -1,3 +1,5 @@
+import time
+
 import gtsam
 import numpy as np
 import rclpy
@@ -8,7 +10,7 @@ from px4_msgs.msg import SensorCombined, SensorGps, VehicleMagnetometer
 from px4_slam_interfaces.msg import MatchedPoints
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo
 
 
 class PX4Slam(Node):
@@ -16,6 +18,7 @@ class PX4Slam(Node):
     biasNoise: gtsam.noiseModel.Isotropic
     pim: gtsam.PreintegratedImuMeasurements
     latest_gps_msg: SensorGps | None = None
+    trajectory: list[list[float]] = []
     latest_mag_msg: VehicleMagnetometer | None = None
     latest_matched_points: MatchedPoints | None = None
     latest_camera_info_msg: CameraInfo | None = None
@@ -32,11 +35,15 @@ class PX4Slam(Node):
 
     def __init__(self):
         super().__init__("px4_slam")
-        rr.init("state_estimation")
+
+        self.declare_parameter("recording_id", str(int(time.time())))
+        recording_id = (
+            self.get_parameter("recording_id").get_parameter_value().string_value
+        )
+
+        rr.init("super_flow", recording_id=recording_id)
         rr.spawn()
         rr.log("world", rr.ViewCoordinates.FRD, static=True)
-        rr.log("world/drone", rr.TransformAxes3D(axis_length=1.0), static=True)
-        self.trajectory: list[list[float]] = []
 
         self._imu_sub: rclpy.node.Subscription = self.create_subscription(
             SensorCombined,
@@ -212,6 +219,7 @@ class PX4Slam(Node):
                 rotation=rr.Quaternion(xyzw=[q.x(), q.y(), q.z(), q.w()]),
             ),
         )
+        rr.log("world/drone/axes", rr.TransformAxes3D(axis_length=1.0), static=True)
         # accumulate and redraw the full path
         self.trajectory.append([t[0], t[1], t[2]])
         rr.log(
