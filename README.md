@@ -4,10 +4,10 @@
 ~TODO: add gps~  
 ~TODO: add magnetometer~  
 ~TODO: add camera~
-TODO: make frontend for slam
-TODO: connect frontend with isam2 backend
-TODO: create pointcloud, visualize
-TODO: tune
+TODO: make frontend for slam  
+TODO: connect frontend with isam2 backend  
+TODO: create pointcloud, visualize  
+TODO: tune  
 
 
 Point tracking and loop closure with SuperFlow
