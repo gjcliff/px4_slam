@@ -1,15 +1,22 @@
 # PX4 SLAM with GTSAM
 
-TODO: add camera  
-~TODO: add magnetometer~  
-~TODO: add gps~  
 ~TODO: add instructions~  
+~TODO: add gps~  
+~TODO: add magnetometer~  
+~TODO: add camera~
+TODO: make frontend for slam
+TODO: connect frontend with isam2 backend
+TODO: create pointcloud, visualize
+TODO: tune
 
-State estimation with GPS, IMU, and magnetometer
-[![Watch the video](https://img.youtube.com/vi/rOaBWvPd-hU/maxresdefault.jpg)](https://youtu.be/rOaBWvPd-hU)
+
+Point tracking and loop closure with SuperFlow
 
 SuperFlow: Barebone SLAM Frontend with SuperPoint and OpticalFlow:
 [![Watch the video](https://img.youtube.com/vi/RQ9UBKWL5aE/maxresdefault.jpg)](https://youtu.be/RQ9UBKWL5aE)
+
+State estimation with GPS, IMU, and magnetometer
+[![Watch the video](https://img.youtube.com/vi/rOaBWvPd-hU/maxresdefault.jpg)](https://youtu.be/rOaBWvPd-hU)
 
 ## dev setup
 we are working with px4 v1.16
@@ -107,5 +114,5 @@ terminal 3:
 cd ~/repos/ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-ros2 run px4_slam gtsam
+ros2 launch px4_slam slam.launch.py
 ```
