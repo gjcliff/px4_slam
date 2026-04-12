@@ -11,6 +11,8 @@ TODO: tune
 
 
 Point tracking and loop closure with SuperFlow
+[![Watch the video](https://img.youtube.com/vi/hdZAStgAwws/maxresdefault.jpg)](https://youtu.be/hdZAStgAwws)
+https://youtu.be/hdZAStgAwws
 
 SuperFlow: Barebone SLAM Frontend with SuperPoint and OpticalFlow:
 [![Watch the video](https://img.youtube.com/vi/RQ9UBKWL5aE/maxresdefault.jpg)](https://youtu.be/RQ9UBKWL5aE)
