@@ -212,7 +212,7 @@ class MatchPoints(Node):
             cv2.putText(img_curr, str(tid), hist[-1], cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
 
         rr.set_time("frame", sequence=self.frame_count)
-        rr.log("camera/tracks", rr.Image(img_curr))
+        rr.log("camera/tracks", rr.Image(img_curr), static=True)
 
         self.get_logger().info(
             f"tracked: {len(track_ids)}, mature: {int(mature_mask.sum()) if len(track_ids) > 0 else 0}, next_id: {self.next_track_id}"
