@@ -1,4 +1,4 @@
-# PX4 SLAM with GTSAM
+# SuperFlow
 
 ~TODO: add instructions~  
 ~TODO: add gps~  
