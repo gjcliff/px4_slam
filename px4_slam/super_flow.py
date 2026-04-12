@@ -25,6 +25,7 @@ class SuperFlow(Node):
     latest_gps_msg: SensorGps | None = None
     latest_mag_msg: VehicleMagnetometer | None = None
     min_keyframe_distance: float = 2.5
+    min_keyframes: int = 20
     min_separation: float = 2.0
     keyframe_db: list[dict] = []
     ref_sin_lat: float | None = None
@@ -212,6 +213,24 @@ class SuperFlow(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return np.arctan2(siny_cosp, cosy_cosp)
 
+    def position_from_pose(self, pose: Pose) -> np.ndarray:
+        return np.array([pose.position.x, pose.position.y, pose.position.z])
+
+    def rpy_from_pose(self, pose: Pose) -> tuple[float, float, float]:
+        q = pose.orientation
+        # roll
+        sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+        cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+        # pitch
+        sinp = 2.0 * (q.w * q.y - q.z * q.x)
+        pitch = np.arcsin(np.clip(sinp, -1.0, 1.0))
+        # yaw
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        return roll, pitch, yaw
+
     def match_lost_track(self, desc: np.ndarray, threshold: float = 0.7) -> int | None:
         if len(self.lost_track_descriptors) == 0:
             return None
@@ -279,16 +298,17 @@ class SuperFlow(Node):
         north, east = self.project(gps_msg.latitude_deg, gps_msg.longitude_deg)
         down = -(gps_msg.altitude_msl_m - self.ref_alt)
         assert self.latest_image_msg is not None
-        img = self.ros_image_to_numpy(self.latest_image_msg)
-        img_small = cv2.resize(img, (320, 240))
+        img = self.ros_image_to_numpy(self.latest_image_msg).copy()
+        # img_small = cv2.resize(img, (320, 240))
         self.keyframe_db.append(
             {
                 "keyframe_id": keyframe_id,
-                "gps": np.array([north, east, down]),
+                "ned_pos": np.array([north, east, down]),
                 "pose": pose,
                 "descriptors": descriptors,  # (K, 256) for current matched points
                 "pts": pts,  # (K, 2) pixel coordinates
-                "image": img_small,
+                "image": img,
+                # "image": img_small,
             }
         )
         self.get_logger().info(
@@ -298,50 +318,69 @@ class SuperFlow(Node):
     def find_loop_candidates(
         self,
         current_gps: np.ndarray,
-        radius: float = 5.0,
-        max_yaw_diff: float = np.radians(45),
+        radius: float = 2.0,
+        max_roll_diff: float = np.radians(20),
+        max_pitch_diff: float = np.radians(20),
+        max_yaw_diff: float = np.radians(20),
     ) -> list[dict]:
-        if len(self.keyframe_db) < 20:
+        if len(self.keyframe_db) < self.min_keyframes:
             self.get_logger().info(
-                f"loop closure: not enough keyframes yet ({len(self.keyframe_db)}/50)"
+                f"loop closure: not enough keyframes yet ({len(self.keyframe_db)}/{self.min_keyframes})"
             )
             return []
         assert self.latest_pose is not None
-        current_yaw = self.yaw_from_pose(self.latest_pose.pose)
+        curr_roll, curr_pitch, curr_yaw = self.rpy_from_pose(self.latest_pose.pose)
+        curr_ned = self.position_from_pose(self.latest_pose.pose)
         candidates = []
         gps_candidates = 0
         separation_candidates = 0
         yaw_candidates = 0
         for kf in self.keyframe_db:
-            dist_to_candidate = np.linalg.norm(kf["gps"] - current_gps)
+            dist_to_candidate = np.linalg.norm(kf["ned_pos"] - current_gps)
             if dist_to_candidate < radius:
                 gps_candidates += 1
-                dist_traveled_since = np.linalg.norm(
-                    self.keyframe_db[-1]["gps"] - kf["gps"]
-                )
                 idx = self.keyframe_db.index(kf)
                 frames_since = len(self.keyframe_db) - idx
-                if frames_since > 10 and dist_traveled_since > self.min_separation:
+                if frames_since > 10:
                     separation_candidates += 1
-                    past_yaw = self.yaw_from_pose(kf["pose"])
+                    past_roll, past_pitch, past_yaw = self.rpy_from_pose(kf["pose"])
                     yaw_diff = abs(
                         np.arctan2(
-                            np.sin(current_yaw - past_yaw),
-                            np.cos(current_yaw - past_yaw),
+                            np.sin(curr_yaw - past_yaw), np.cos(curr_yaw - past_yaw)
                         )
                     )
-                    if yaw_diff < max_yaw_diff:
+                    pitch_diff = abs(
+                        np.arctan2(
+                            np.sin(curr_pitch - past_pitch),
+                            np.cos(curr_pitch - past_pitch),
+                        )
+                    )
+                    roll_diff = abs(
+                        np.arctan2(
+                            np.sin(curr_roll - past_roll), np.cos(curr_roll - past_roll)
+                        )
+                    )
+                    alt_diff = abs(curr_ned[2] - kf["ned_pos"][2])
+                    reason = None
+                    if yaw_diff >= max_yaw_diff:
+                        reason = f"yaw={np.degrees(yaw_diff):.1f}deg"
+                    elif pitch_diff >= max_pitch_diff:
+                        reason = f"pitch={np.degrees(pitch_diff):.1f}deg"
+                    elif roll_diff >= max_roll_diff:
+                        reason = f"roll={np.degrees(roll_diff):.1f}deg"
+                    elif alt_diff >= 3.0:
+                        reason = f"alt={alt_diff:.1f}m"
+                    if reason is None:
                         yaw_candidates += 1
                         candidates.append(kf)
                     else:
-                        self.get_logger().debug(
-                            f"loop closure: keyframe {kf['keyframe_id']} rejected by yaw "
-                            f"(diff={np.degrees(yaw_diff):.1f}deg)"
+                        self.get_logger().info(
+                            f"rejected kf {kf['keyframe_id']}: {reason}"
                         )
                 else:
-                    self.get_logger().debug(
-                        f"loop closure: keyframe {kf['keyframe_id']} rejected by separation "
-                        f"(dist={dist_traveled_since:.1f}m < {self.min_separation}m)"
+                    self.get_logger().info(
+                        f"rejected kf {kf['keyframe_id']}: frames_since={frames_since}, "
+                        f"(need {self.min_separation}m)"
                     )
         self.get_logger().info(
             f"loop closure search: {len(self.keyframe_db)} keyframes, "
@@ -358,31 +397,49 @@ class SuperFlow(Node):
         pts_curr: np.ndarray,
         pts_past: np.ndarray,
     ) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
-        desc_curr_t = torch.from_numpy(desc_curr).cuda()
-        desc_past_t = torch.from_numpy(desc_past).cuda()
-        desc_curr_t = torch.nn.functional.normalize(desc_curr_t, dim=1)
-        desc_past_t = torch.nn.functional.normalize(desc_past_t, dim=1)
-        sim = torch.mm(desc_curr_t, desc_past_t.T)
-        best_matches = sim.argmax(dim=1)
-        best_scores = sim.max(dim=1).values
-        good_mask = best_scores > 0.8
+        desc_curr_t = torch.nn.functional.normalize(
+            torch.from_numpy(desc_curr).cuda(), dim=1
+        )
+        desc_past_t = torch.nn.functional.normalize(
+            torch.from_numpy(desc_past).cuda(), dim=1
+        )
+        sim = torch.mm(desc_curr_t, desc_past_t.T)  # (K_curr, K_past)
+
+        # forward: best match in past for each current descriptor
+        best_matches_fwd = sim.argmax(dim=1)  # (K_curr,)
+        best_scores_fwd = sim.max(dim=1).values
+
+        # backward: best match in current for each past descriptor
+        best_matches_bwd = sim.argmax(dim=0)  # (K_past,)
+
+        # mutual nearest neighbor: forward match must agree with backward match
+        mutual_mask = torch.zeros(len(desc_curr), dtype=torch.bool, device="cuda")
+        for i, j in enumerate(best_matches_fwd):
+            if best_matches_bwd[j] == i:
+                mutual_mask[i] = True
+
+        # combine with score threshold
+        good_mask = mutual_mask & (best_scores_fwd > 0.95)
+
         n_good = good_mask.sum().item()
         self.get_logger().info(
-            f"verify loop closure: {n_good} good matches out of {len(desc_curr)} "
-            f"(need 10, max score={best_scores.max().item():.3f}, "
-            f"mean score={best_scores.mean().item():.3f})"
+            f"verify loop closure: {n_good} mutual matches out of {len(desc_curr)} "
+            f"(max score={best_scores_fwd.max().item():.3f}, "
+            f"mean score={best_scores_fwd[good_mask].mean().item() if n_good > 0 else 0:.3f})"
         )
+
         if n_good < 10:
             return False, None, None
+
         matched_pts_curr = pts_curr[good_mask.cpu().numpy()]
-        matched_pts_past = pts_past[best_matches[good_mask].cpu().numpy()]
-        self.get_logger().info(f"loop closure VERIFIED: {n_good} inliers")
+        matched_pts_past = pts_past[best_matches_fwd[good_mask].cpu().numpy()]
+        self.get_logger().info(f"loop closure VERIFIED: {n_good} mutual inliers")
         return True, matched_pts_curr, matched_pts_past
 
     def should_store_keyframe(self, current_gps: np.ndarray) -> bool:
         if len(self.keyframe_db) == 0:
             return True
-        last_gps = self.keyframe_db[-1]["gps"]
+        last_gps = self.keyframe_db[-1]["ned_pos"]
         return bool(np.linalg.norm(current_gps - last_gps) > self.min_keyframe_distance)
 
     def image_callback(self, msg: Image):
@@ -567,6 +624,9 @@ class SuperFlow(Node):
                             candidate["pose"].position.y,
                             candidate["pose"].position.z,
                         ]
+                        self.get_logger().info(
+                            f"pts_curr: {len(pts_curr)}, pts_past: {len(pts_past)}"  # ty: ignore
+                        )
                         rr.set_time("keyframe", sequence=self.count)
                         rr.log(
                             f"world/loop_closures/{self.count}",

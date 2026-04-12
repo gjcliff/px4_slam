@@ -37,19 +37,15 @@ class SquareFlyer(Node):
             qos,
         )
 
+        self.waypoints_set = False
         self.altitude = -10.0
         self.side_length = 20.0
         self.cruise_speed = 3.0  # m/s
-        self.yaw_rate = 0.5  # rad/s for turning at corners
+        self.yaw_rate = 1.0  # rad/s for turning at corners
 
         # waypoints: (x, y, z, yaw) — yaw in radians, NED frame
         # yaw: 0=north, pi/2=east, pi=south, -pi/2=west
-        self.waypoints = [
-            [self.side_length, 0.0,              self.altitude, 0.0],          # fly north
-            [self.side_length, self.side_length, self.altitude, np.pi / 2],    # fly east
-            [0.0,              self.side_length, self.altitude, np.pi],         # fly south
-            [0.0,              0.0,              self.altitude, -np.pi / 2],    # fly west
-        ]
+        self.waypoints = []
         self.current_waypoint = 0
         self.waypoint_threshold = 1.5
 
@@ -60,6 +56,21 @@ class SquareFlyer(Node):
 
     def local_pos_callback(self, msg: VehicleLocalPosition):
         self.local_pos = msg
+
+    def maybe_set_waypoints(self):
+        if self.waypoints_set or self.local_pos is None:
+            return
+        x0 = self.local_pos.x
+        y0 = self.local_pos.y
+        s = self.side_length
+        self.waypoints = [
+            [x0 + s, y0, self.altitude, 0.0],
+            [x0 + s, y0 + s, self.altitude + 1.0, np.pi / 2],
+            [x0, y0 + s, self.altitude, np.pi],
+            [x0, y0, self.altitude + 1.0, -np.pi / 2],
+        ]
+        self.waypoints_set = True
+        self.get_logger().info(f"waypoints set from origin ({x0:.1f}, {y0:.1f})")
 
     def publish_offboard_control_mode(self):
         msg = OffboardControlMode()
@@ -79,7 +90,7 @@ class SquareFlyer(Node):
             float("nan"),
         ]  # must be nan for velocity control
         msg.velocity = [float(vx), float(vy), float(vz)]
-        msg.yaw = yaw
+        msg.yaw = float("nan")
         msg.yawspeed = float(yawspeed)  # rad/s
         msg.timestamp = self.get_clock().now().nanoseconds // 1000
         self._setpoint_pub.publish(msg)
@@ -133,6 +144,9 @@ class SquareFlyer(Node):
         return dist < self.waypoint_threshold
 
     def timer_callback(self):
+        self.maybe_set_waypoints()
+        if not self.waypoints_set:
+            return
         wp = self.waypoints[self.current_waypoint]
         vx, vy, vz = self.compute_velocity()
 

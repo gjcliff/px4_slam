@@ -29,6 +29,7 @@ setup(
         "console_scripts": [
             "gtsam = px4_slam.gtsam:main",
             "super_flow = px4_slam.super_flow:main",
+            "square_flier = px4_slam.square_flier:main",
         ],
     },
 )
