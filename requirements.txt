@@ -1,2 +1,3 @@
 gtsam-develop 
-rerun
+rerun-sdk
+external/LightGlue

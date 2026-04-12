@@ -1,0 +1,3 @@
+[submodule "external/LightGlue"]
+	path = external/LightGlue
+	url = https://github.com/cvg/LightGlue.git

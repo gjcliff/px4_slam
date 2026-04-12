@@ -7,9 +7,8 @@
   <maintainer email="gjcliff@gmail.com">Graham Clifford</maintainer>
   <license>TODO: License declaration</license>
 
-  <depend>gtsam</depend>
-  <depend>python3-gtsam</depend>
   <depend>message_filters</depend>
+  <depend>cv_bridge</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

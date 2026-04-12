@@ -4,8 +4,10 @@ import rclpy
 import rerun as rr
 from gtsam.symbol_shorthand import B, V, X
 from px4_msgs.msg import SensorCombined, SensorGps, VehicleMagnetometer
+from px4_slam_interfaces.msg import MatchedPoints
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CameraInfo, Image
 
 
 class PX4Slam(Node):
@@ -14,15 +16,22 @@ class PX4Slam(Node):
     pim: gtsam.PreintegratedImuMeasurements
     latest_gps_msg: SensorGps | None = None
     latest_mag_msg: VehicleMagnetometer | None = None
+    latest_matched_points: MatchedPoints | None = None
+    latest_camera_info_msg: CameraInfo | None = None
+    ref_sin_lat: float | None = None
+    ref_cos_lat: float | None = None
+    ref_lat: float | None = None
+    ref_lon: float | None = None
+    ref_alt: float | None = None
     prev_timestamp: int | None = None
     count: int = 0
-    ref_lat: float = 0.0
-    ref_lon: float = 0.0
-    ref_alt: float = 0.0
+
+    K: gtsam.Cal3_S2 | None = None
+    pixelNoise: gtsam.noiseModel.Isotropic | None = None
 
     def __init__(self):
         super().__init__("px4_slam")
-        rr.init("rerun_gtsam")
+        rr.init("state_estimation")
         rr.spawn()
         rr.log("world", rr.ViewCoordinates.FRD, static=True)
         rr.log("world/drone", rr.TransformAxes3D(axis_length=1.0), static=True)
@@ -30,20 +39,32 @@ class PX4Slam(Node):
 
         self._imu_sub: rclpy.node.Subscription = self.create_subscription(
             SensorCombined,
-            "/fmu/out/sensor_combined",
+            "fmu/out/sensor_combined",
             self.imu_callback,
             qos_profile=qos_profile_sensor_data,
         )
         self._gps_sub: rclpy.node.Subscription = self.create_subscription(
             SensorGps,
-            "/fmu/out/sensor_gps",
+            "fmu/out/sensor_gps",
             self.gps_callback,
             qos_profile=qos_profile_sensor_data,
         )
         self._magnetometer_sub: rclpy.node.Subscription = self.create_subscription(
             VehicleMagnetometer,
-            "/fmu/out/vehicle_magnetometer",
+            "fmu/out/vehicle_magnetometer",
             self.magnetometer_callback,
+            qos_profile=qos_profile_sensor_data,
+        )
+        self._matched_points_sub: rclpy.node.Subscription = self.create_subscription(
+            MatchedPoints,
+            "camera/matched_points",
+            self.matched_points_callback,
+            qos_profile=qos_profile_sensor_data,
+        )
+        self._camera_info_sub: rclpy.node.Subscription = self.create_subscription(
+            CameraInfo,
+            "camera/camera_info",
+            self.camera_info_callback,
             qos_profile=qos_profile_sensor_data,
         )
 
@@ -64,16 +85,17 @@ class PX4Slam(Node):
         self.ref_alt = alt_0
         self.ref_lat = np.radians(lat_0)
         self.ref_lon = np.radians(lon_0)
+        self.ref_sin_lat = np.sin(self.ref_lat)
+        self.ref_cos_lat = np.cos(self.ref_lat)
 
-    def project(self, lat: float, lon: float):
-        assert self.ref_lat is not None
+    def project(self, lat, lon):
         lat_rad = np.radians(lat)
         lon_rad = np.radians(lon)
         sin_lat = np.sin(lat_rad)
         cos_lat = np.cos(lat_rad)
         cos_d_lon = np.cos(lon_rad - self.ref_lon)
         arg = np.clip(
-            np.sin(self.ref_lat) * sin_lat + np.cos(self.ref_lat) * cos_lat * cos_d_lon,
+            self.ref_sin_lat * sin_lat + self.ref_cos_lat * cos_lat * cos_d_lon,
             -1.0,
             1.0,
         )
@@ -81,7 +103,7 @@ class PX4Slam(Node):
         k = c / np.sin(c) if abs(c) > 0 else 1.0
         north = (
             k
-            * (np.cos(self.ref_lat) * sin_lat - np.sin(self.ref_lat) * cos_lat * cos_d_lon)
+            * (self.ref_cos_lat * sin_lat - self.ref_sin_lat * cos_lat * cos_d_lon)
             * 6371000
         )
         east = k * cos_lat * np.sin(lon_rad - self.ref_lon) * 6371000
@@ -90,7 +112,7 @@ class PX4Slam(Node):
     def add_gps_factor(
         self, graph: gtsam.NonlinearFactorGraph, key: int, msg: SensorGps
     ):
-        if self.ref_lat is None:
+        if self.ref_sin_lat is None:
             self.init_reference(msg.latitude_deg, msg.longitude_deg, msg.altitude_msl_m)
         north, east = self.project(msg.latitude_deg, msg.longitude_deg)
         down = -(msg.altitude_msl_m - self.ref_alt)
@@ -101,7 +123,7 @@ class PX4Slam(Node):
     def add_mag_factor(
         self, graph: gtsam.NonlinearFactorGraph, key: int, msg: VehicleMagnetometer
     ):
-        self.magNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
+        self.magNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.5)
         yaw = np.arctan2(-msg.magnetometer_ga[1], msg.magnetometer_ga[0])
         rot = gtsam.Rot3.Yaw(yaw)
         pose = gtsam.Pose3(rot, gtsam.Point3(0, 0, 0))
@@ -132,15 +154,6 @@ class PX4Slam(Node):
         values.insert(V(0), initial_velocity)
         return graph, values
 
-    def setup_visual_factors(
-        self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values
-    ):
-        K = gtsam.Cal3_S2(50.0, 50.0, 0.0, 50.0, 50.0)
-
-        measurement_noise = gtsam.noiseModel.Isotropic.Sigma(
-            2, 1.0
-        )  # one pixel in u and v
-
     def setup_imu_factors(
         self, graph: gtsam.NonlinearFactorGraph, values: gtsam.Values
     ):
@@ -160,9 +173,9 @@ class PX4Slam(Node):
     def preintegration_parameters(self):
         params = gtsam.PreintegrationParams.MakeSharedD(9.81)
         I = np.eye(3)  # noqa: E741
-        params.setAccelerometerCovariance(I * 0.1)
-        params.setGyroscopeCovariance(I * 0.1)
-        params.setIntegrationCovariance(I * 0.1)
+        params.setAccelerometerCovariance(I * 0.01)
+        params.setGyroscopeCovariance(I * 0.001)
+        params.setIntegrationCovariance(I * 0.01)
         params.setUse2ndOrderCoriolis(False)
         params.setOmegaCoriolis(np.array([0, 0, 0], dtype=float))
         return params
@@ -197,7 +210,7 @@ class PX4Slam(Node):
 
         self.pim.integrateMeasurement(accel, gyro, dt_accel)
 
-        if msg.timestamp - self.prev_timestamp > 100_000:  # 10hz
+        if msg.timestamp - self.prev_timestamp > 50_000:  # 100hz
             graph = gtsam.NonlinearFactorGraph()
             values = gtsam.Values()
 
@@ -256,14 +269,26 @@ class PX4Slam(Node):
     def magnetometer_callback(self, msg: VehicleMagnetometer):
         self.latest_mag_msg = msg
 
+    def matched_points_callback(self, msg: Image): ...
+
+    def camera_info_callback(self, msg: CameraInfo):
+        if self.K is None:
+            self.K = gtsam.Cal3_S2(
+                msg.k[0],  # fx
+                msg.k[4],  # fy
+                msg.k[1],  # s (skew)
+                msg.k[2],  # u0 (cx)
+                msg.k[5],  # v0 (cy)
+            )
+
 
 def main(args=None):
     rclpy.init(args=args)
 
-    minimal_subscriber = PX4Slam()
-    rclpy.spin(minimal_subscriber)
+    px4_slam = PX4Slam()
+    rclpy.spin(px4_slam)
 
-    minimal_subscriber.destroy_node()
+    px4_slam.destroy_node()
     rclpy.shutdown()
 
 
