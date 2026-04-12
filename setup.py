@@ -28,8 +28,6 @@ setup(
     entry_points={
         "console_scripts": [
             "gtsam = px4_slam.gtsam:main",
-            "match_points = px4_slam.match_points:main",
-            "optical_flow = px4_slam.optical_flow:main",
             "super_flow = px4_slam.super_flow:main",
         ],
     },
