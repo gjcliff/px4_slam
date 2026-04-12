@@ -16,12 +16,12 @@ def generate_launch_description():
                 package="ros_gz_bridge",
                 executable="parameter_bridge",
                 arguments=[
-                    "/world/baylands/model/x500_mono_cam_0/link/camera_link/sensor/imager/image@sensor_msgs/msg/Image@gz.msgs.Image",
-                    "/world/baylands/model/x500_mono_cam_0/link/camera_link/sensor/imager/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo",
+                    "/world/walls/model/x500_mono_cam_0/link/camera_link/sensor/imager/image@sensor_msgs/msg/Image@gz.msgs.Image",
+                    "/world/walls/model/x500_mono_cam_0/link/camera_link/sensor/imager/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo",
                 ],
                 remappings=[
-                    ("/world/baylands/model/x500_mono_cam_0/link/camera_link/sensor/imager/image", "/camera/image_raw"),
-                    ("/world/baylands/model/x500_mono_cam_0/link/camera_link/sensor/imager/camera_info", "/camera/camera_info"),
+                    ("/world/walls/model/x500_mono_cam_0/link/camera_link/sensor/imager/image", "/camera/image_raw"),
+                    ("/world/walls/model/x500_mono_cam_0/link/camera_link/sensor/imager/camera_info", "/camera/camera_info"),
                 ],
                 output="screen",
             ),

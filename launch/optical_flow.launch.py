@@ -9,15 +9,9 @@ def generate_launch_description():
             Node(
                 package="px4_slam",
                 namespace="",
-                executable="gtsam",
-                name="state_estimation",
+                executable="optical_flow",
+                name="optical_flow",
             ),
-            # Node(
-            #     package="px4_slam",
-            #     namespace="",
-            #     executable="match_points",
-            #     name="match_points",
-            # ),
             Node(
                 package="ros_gz_bridge",
                 executable="parameter_bridge",
