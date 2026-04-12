@@ -2,6 +2,7 @@ import gtsam
 import numpy as np
 import rclpy
 import rerun as rr
+from geometry_msgs.msg import PoseStamped
 from gtsam.symbol_shorthand import B, V, X
 from px4_msgs.msg import SensorCombined, SensorGps, VehicleMagnetometer
 from px4_slam_interfaces.msg import MatchedPoints
@@ -68,6 +69,10 @@ class PX4Slam(Node):
             qos_profile=qos_profile_sensor_data,
         )
 
+        self._pose_pub = self.create_publisher(
+            PoseStamped, "state_estimate/pose", qos_profile_sensor_data
+        )
+
         parameters = gtsam.ISAM2Params()
         parameters.setRelinearizeThreshold(0.01)
         parameters.relinearizeSkip = 1
@@ -119,6 +124,7 @@ class PX4Slam(Node):
         gps = gtsam.Point3(north, east, down)
         gpsNoise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
         graph.add(gtsam.GPSFactor(key, gps, gpsNoise))
+        return north, east, down
 
     def add_mag_factor(
         self, graph: gtsam.NonlinearFactorGraph, key: int, msg: VehicleMagnetometer
@@ -180,6 +186,21 @@ class PX4Slam(Node):
         params.setOmegaCoriolis(np.array([0, 0, 0], dtype=float))
         return params
 
+    def publish_pose(self, pose: gtsam.Pose3):
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "world"
+        t = pose.translation()
+        q = pose.rotation().toQuaternion()
+        msg.pose.position.x = t[0]
+        msg.pose.position.y = t[1]
+        msg.pose.position.z = t[2]
+        msg.pose.orientation.x = q.x()
+        msg.pose.orientation.y = q.y()
+        msg.pose.orientation.z = q.z()
+        msg.pose.orientation.w = q.w()
+        self._pose_pub.publish(msg)
+
     def log_pose(self, pose: gtsam.Pose3):
         t = pose.translation()
         q = pose.rotation().toQuaternion()
@@ -217,7 +238,9 @@ class PX4Slam(Node):
             i = self.count
 
             if self.latest_gps_msg is not None:
-                self.add_gps_factor(graph, X(i + 1), self.latest_gps_msg)
+                north, east, down = self.add_gps_factor(
+                    graph, X(i + 1), self.latest_gps_msg
+                )
                 self.latest_gps_msg = None
 
             if self.latest_mag_msg is not None:
@@ -256,8 +279,9 @@ class PX4Slam(Node):
             self.isam.update(graph, values)
             pose = self.isam.calculateEstimatePose3(X(i + 1))
             self.log_pose(pose)
-            if self.count % 10 == 0:
-                self.get_logger().info(str(pose))
+            self.publish_pose(pose)
+            # if self.count % 10 == 0:
+            #     self.get_logger().info(str(pose))
 
             self.pim.resetIntegration()
             self.prev_timestamp = msg.timestamp
@@ -269,7 +293,7 @@ class PX4Slam(Node):
     def magnetometer_callback(self, msg: VehicleMagnetometer):
         self.latest_mag_msg = msg
 
-    def matched_points_callback(self, msg: Image): ...
+    def matched_points_callback(self, msg: MatchedPoints): ...
 
     def camera_info_callback(self, msg: CameraInfo):
         if self.K is None:

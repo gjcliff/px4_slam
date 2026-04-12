@@ -12,12 +12,12 @@ def generate_launch_description():
                 executable="gtsam",
                 name="state_estimation",
             ),
-            # Node(
-            #     package="px4_slam",
-            #     namespace="",
-            #     executable="match_points",
-            #     name="match_points",
-            # ),
+            Node(
+                package="px4_slam",
+                namespace="",
+                executable="super_flow",
+                name="super_flow",
+            ),
             Node(
                 package="ros_gz_bridge",
                 executable="parameter_bridge",

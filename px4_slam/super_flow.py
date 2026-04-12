@@ -3,8 +3,10 @@ import numpy as np
 import rclpy
 import rerun as rr
 import torch
+from geometry_msgs.msg import Pose, PoseStamped
 from lightglue import SuperPoint
-from px4_slam_interfaces.msg import MatchedPoints
+from px4_msgs.msg import SensorGps, VehicleMagnetometer
+from px4_slam_interfaces.msg import LoopClosure, MatchedPoints
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
@@ -16,6 +18,25 @@ torch.set_float32_matmul_precision("high")
 class MatchPoints(Node):
     latest_image_msg: Image | None
     latest_camera_info_msg: CameraInfo | None
+    latest_pose: PoseStamped | None = None
+    latest_gps_msg: SensorGps | None = None
+    latest_mag_msg: VehicleMagnetometer | None = None
+    min_keyframe_distance: float = 2.5
+    min_separation: float = 2.0
+    keyframe_db: list[dict] = []
+    ref_sin_lat: float | None = None
+    ref_cos_lat: float | None = None
+    ref_lat: float | None = None
+    ref_lon: float | None = None
+    ref_alt: float | None = None
+
+    # self.keyframe_db.append(
+    #     {
+    #         "keyframe_id": i,
+    #         "pose": pose,
+    #         "gps": (north, east, down),
+    #     }
+    # )
 
     def __init__(self):
         super().__init__("match_points")
@@ -23,17 +44,32 @@ class MatchPoints(Node):
         rr.spawn()
         rr.log("world", rr.ViewCoordinates.FRD, static=True)
 
-        self._image_sub = self.create_subscription(
+        self._matched_points_pub: rclpy.node.Publisher = self.create_publisher(
+            MatchedPoints, "camera/matched_points", qos_profile_sensor_data
+        )
+        self._loop_closure_pub: rclpy.node.Publisher = self.create_publisher(
+            LoopClosure, "camera/loop_closure", qos_profile_sensor_data
+        )
+        self._image_sub: rclpy.node.Subscription = self.create_subscription(
             Image, "camera/image_raw", self.image_callback, qos_profile_sensor_data
         )
-        self._camera_info_sub = self.create_subscription(
-            CameraInfo,
-            "camera/camera_info",
-            self.camera_info_callback,
-            qos_profile_sensor_data,
+        self._state_estimate_sub: rclpy.node.Subscription = self.create_subscription(
+            PoseStamped,
+            "state_estimate/pose",
+            self.pose_callback,
+            qos_profile=qos_profile_sensor_data,
         )
-        self._matched_points_pub = self.create_publisher(
-            MatchedPoints, "camera/matched_points", qos_profile_sensor_data
+        self._gps_sub: rclpy.node.Subscription = self.create_subscription(
+            SensorGps,
+            "fmu/out/sensor_gps",
+            self.gps_callback,
+            qos_profile=qos_profile_sensor_data,
+        )
+        self._magnetometer_sub: rclpy.node.Subscription = self.create_subscription(
+            VehicleMagnetometer,
+            "fmu/out/vehicle_magnetometer",
+            self.magnetometer_callback,
+            qos_profile=qos_profile_sensor_data,
         )
 
         # superpoint for detection only, no matcher needed
@@ -43,10 +79,8 @@ class MatchPoints(Node):
             .cuda()
         )
 
-        self.track_history: dict[
-            int, list[tuple[int, int]]
-        ] = {}  # track_id -> list of (x, y)
-        self.max_history_len: int = 10
+        self.max_lost_memory: int = 30  # frames to remember lost tracks
+        self.max_history_len: int = 10  # max track history for viz
 
         # lk optical flow params
         self.lk_params = dict(
@@ -62,6 +96,13 @@ class MatchPoints(Node):
         self.prev_pts: np.ndarray | None = None  # (N, 1, 2) float32
         self.track_ids: list[int] = []
         self.track_lengths: dict[int, int] = {}
+        # track_id -> (256,) descriptor
+        self.track_descriptors: dict[int, np.ndarray] = {}
+        # recently lost track_id -> descriptor
+        self.lost_track_descriptors: dict[int, np.ndarray] = {}
+        self.lost_track_age: dict[int, int] = {}  # track_id -> frames since lost
+        # track_id -> list of (x, y)
+        self.track_history: dict[int, list[tuple[int, int]]] = {}
         self.next_track_id: int = 0
         self.min_track_length: int = 3
 
@@ -88,11 +129,12 @@ class MatchPoints(Node):
             img = img[..., ::-1]
         return img
 
-    def detect_with_superpoint(self, msg: Image) -> np.ndarray:
+    def detect_with_superpoint(self, msg: Image) -> tuple[np.ndarray, np.ndarray]:
         gpu_img = self.ros_image_to_tensor(msg)
         feats = self.extractor.extract(gpu_img)
         kps = feats["keypoints"][0].cpu().numpy()  # (N, 2)
-        return kps.reshape(-1, 1, 2).astype(np.float32)
+        desc = feats["descriptors"][0].cpu().numpy()  # (N, 256)
+        return kps.reshape(-1, 1, 2).astype(np.float32), desc
 
     def draw_track_ids(
         self, img: np.ndarray, pts: np.ndarray, track_ids: list[int]
@@ -106,34 +148,238 @@ class MatchPoints(Node):
         return img
 
     def redetect_and_merge(self, msg: Image) -> np.ndarray:
-        new_pts = self.detect_with_superpoint(msg)  # (N, 1, 2)
+        new_pts, new_descs = self.detect_with_superpoint(msg)
 
         if self.prev_pts is None or len(self.prev_pts) == 0:
-            # no existing tracks, just assign all new ids
             new_ids = list(range(self.next_track_id, self.next_track_id + len(new_pts)))
             self.next_track_id += len(new_pts)
-            for tid in new_ids:
+            for tid, desc in zip(new_ids, new_descs):
                 self.track_lengths[tid] = 1
+                self.track_descriptors[tid] = desc
             self.track_ids = new_ids
+            self.get_logger().info(
+                f"redetect: first frame, created {len(new_ids)} tracks"
+            )
             return new_pts
 
-        existing = self.prev_pts.reshape(-1, 2)  # (M, 2)
-        candidates = new_pts.reshape(-1, 2)  # (N, 2)
-
+        existing = self.prev_pts.reshape(-1, 2)
+        candidates = new_pts.reshape(-1, 2)
         merged_pts = list(existing)
         merged_ids = list(self.track_ids)
 
-        for pt in candidates:
+        new_count = 0
+        reassociated_count = 0
+        skipped_count = 0
+
+        for pt, desc in zip(candidates, new_descs):
             dists = np.linalg.norm(existing - pt, axis=1)
-            if dists.min() > 10:  # 10 pixel threshold — no nearby existing track
-                tid = self.next_track_id
-                self.next_track_id += 1
-                self.track_lengths[tid] = 1
+            if dists.min() > 10:
+                tid = self.match_lost_track(desc)
+                if tid is None:
+                    tid = self.next_track_id
+                    self.next_track_id += 1
+                    new_count += 1
+                else:
+                    reassociated_count += 1
+                self.track_lengths[tid] = self.track_lengths.get(tid, 0) + 1
+                self.track_descriptors[tid] = desc
                 merged_pts.append(pt)
                 merged_ids.append(tid)
+            else:
+                skipped_count += 1
+
+        # age out lost tracks
+        to_remove = []
+        for tid in self.lost_track_age:
+            self.lost_track_age[tid] += 1
+            if self.lost_track_age[tid] > self.max_lost_memory:
+                to_remove.append(tid)
+        for tid in to_remove:
+            # self.get_logger().info(
+            #     f"redetect: culling lost track {tid} after {self.max_lost_memory} frames"
+            # )
+            del self.lost_track_descriptors[tid]
+            del self.lost_track_age[tid]
 
         self.track_ids = merged_ids
+        # self.get_logger().info(f"redetect: total merged tracks: {len(merged_ids)}")
         return np.array(merged_pts).reshape(-1, 1, 2).astype(np.float32)
+
+    def yaw_from_pose(self, pose: Pose) -> float:
+        # convert quaternion to yaw
+        q = pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return np.arctan2(siny_cosp, cosy_cosp)
+
+    def match_lost_track(self, desc: np.ndarray, threshold: float = 0.7) -> int | None:
+        if len(self.lost_track_descriptors) == 0:
+            return None
+        lost_ids = list(self.lost_track_descriptors.keys())
+        lost_descs = np.stack([self.lost_track_descriptors[tid] for tid in lost_ids])
+        desc_t = torch.from_numpy(desc).cuda().unsqueeze(0)
+        lost_t = torch.from_numpy(lost_descs).cuda()
+        desc_t = torch.nn.functional.normalize(desc_t, dim=1)
+        lost_t = torch.nn.functional.normalize(lost_t, dim=1)
+        sim = torch.mm(desc_t, lost_t.T).squeeze(0)  # (M,)
+        best_idx = sim.argmax().item()
+        best_score = sim[best_idx].item()  # ty: ignore
+
+        if best_score < threshold:
+            return None
+
+        # mutual nearest neighbor check
+        sim_reverse = torch.mm(lost_t[best_idx].unsqueeze(0), desc_t.T).squeeze(0)  # ty: ignore
+        if sim_reverse.argmax().item() != 0:  # 0 because desc_t has only one row
+            return None  # not a mutual match
+
+        tid = lost_ids[best_idx]  # ty: ignore
+        del self.lost_track_descriptors[tid]
+        del self.lost_track_age[tid]
+        return tid
+
+    def init_reference(self, lat_0, lon_0, alt_0):
+        self.ref_alt = alt_0
+        self.ref_lat = np.radians(lat_0)
+        self.ref_lon = np.radians(lon_0)
+        self.ref_sin_lat = np.sin(self.ref_lat)
+        self.ref_cos_lat = np.cos(self.ref_lat)
+
+    def project(self, lat, lon):
+        lat_rad = np.radians(lat)
+        lon_rad = np.radians(lon)
+        sin_lat = np.sin(lat_rad)
+        cos_lat = np.cos(lat_rad)
+        cos_d_lon = np.cos(lon_rad - self.ref_lon)
+        arg = np.clip(
+            self.ref_sin_lat * sin_lat + self.ref_cos_lat * cos_lat * cos_d_lon,
+            -1.0,
+            1.0,
+        )
+        c = np.arccos(arg)
+        k = c / np.sin(c) if abs(c) > 0 else 1.0
+        north = (
+            k
+            * (self.ref_cos_lat * sin_lat - self.ref_sin_lat * cos_lat * cos_d_lon)
+            * 6371000
+        )
+        east = k * cos_lat * np.sin(lon_rad - self.ref_lon) * 6371000
+        return north, east
+
+    def store_keyframe(
+        self,
+        keyframe_id: int,
+        gps_msg: SensorGps,
+        pose: Pose,
+        descriptors: np.ndarray,
+        pts: np.ndarray,
+    ):
+        if self.ref_sin_lat is None:
+            return
+        north, east = self.project(gps_msg.latitude_deg, gps_msg.longitude_deg)
+        down = -(gps_msg.altitude_msl_m - self.ref_alt)
+        self.keyframe_db.append(
+            {
+                "keyframe_id": keyframe_id,
+                "gps": np.array([north, east, down]),
+                "pose": pose,
+                "descriptors": descriptors,  # (K, 256) for current matched points
+                "pts": pts,  # (K, 2) pixel coordinates
+            }
+        )
+        self.get_logger().info(
+            f"storing keyframe! total keyframes: {len(self.keyframe_db)}"
+        )
+
+    def find_loop_candidates(
+        self,
+        current_gps: np.ndarray,
+        radius: float = 5.0,
+        max_yaw_diff: float = np.radians(45),
+    ) -> list[dict]:
+        if len(self.keyframe_db) < 50:
+            self.get_logger().info(
+                f"loop closure: not enough keyframes yet ({len(self.keyframe_db)}/50)"
+            )
+            return []
+        assert self.latest_pose is not None
+        current_yaw = self.yaw_from_pose(self.latest_pose.pose)
+        candidates = []
+        gps_candidates = 0
+        separation_candidates = 0
+        yaw_candidates = 0
+        for kf in self.keyframe_db:
+            dist_to_candidate = np.linalg.norm(kf["gps"] - current_gps)
+            if dist_to_candidate < radius:
+                gps_candidates += 1
+                dist_traveled_since = np.linalg.norm(
+                    self.keyframe_db[-1]["gps"] - kf["gps"]
+                )
+                idx = self.keyframe_db.index(kf)
+                frames_since = len(self.keyframe_db) - idx
+                if frames_since > 10 and dist_traveled_since > self.min_separation:
+                    separation_candidates += 1
+                    past_yaw = self.yaw_from_pose(kf["pose"])
+                    yaw_diff = abs(
+                        np.arctan2(
+                            np.sin(current_yaw - past_yaw),
+                            np.cos(current_yaw - past_yaw),
+                        )
+                    )
+                    if yaw_diff < max_yaw_diff:
+                        yaw_candidates += 1
+                        candidates.append(kf)
+                    else:
+                        self.get_logger().debug(
+                            f"loop closure: keyframe {kf['keyframe_id']} rejected by yaw "
+                            f"(diff={np.degrees(yaw_diff):.1f}deg)"
+                        )
+                else:
+                    self.get_logger().debug(
+                        f"loop closure: keyframe {kf['keyframe_id']} rejected by separation "
+                        f"(dist={dist_traveled_since:.1f}m < {self.min_separation}m)"
+                    )
+        self.get_logger().info(
+            f"loop closure search: {len(self.keyframe_db)} keyframes, "
+            f"{gps_candidates} within {radius}m, "
+            f"{separation_candidates} pass separation, "
+            f"{yaw_candidates} pass yaw -> {len(candidates)} candidates"
+        )
+        return candidates
+
+    def verify_loop_closure(
+        self,
+        desc_curr: np.ndarray,
+        desc_past: np.ndarray,
+        pts_curr: np.ndarray,
+        pts_past: np.ndarray,
+    ) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
+        desc_curr_t = torch.from_numpy(desc_curr).cuda()
+        desc_past_t = torch.from_numpy(desc_past).cuda()
+        desc_curr_t = torch.nn.functional.normalize(desc_curr_t, dim=1)
+        desc_past_t = torch.nn.functional.normalize(desc_past_t, dim=1)
+        sim = torch.mm(desc_curr_t, desc_past_t.T)
+        best_matches = sim.argmax(dim=1)
+        best_scores = sim.max(dim=1).values
+        good_mask = best_scores > 0.8
+        n_good = good_mask.sum().item()
+        self.get_logger().info(
+            f"verify loop closure: {n_good} good matches out of {len(desc_curr)} "
+            f"(need 10, max score={best_scores.max().item():.3f}, "
+            f"mean score={best_scores.mean().item():.3f})"
+        )
+        if n_good < 10:
+            return False, None, None
+        matched_pts_curr = pts_curr[good_mask.cpu().numpy()]
+        matched_pts_past = pts_past[best_matches[good_mask].cpu().numpy()]
+        self.get_logger().info(f"loop closure VERIFIED: {n_good} inliers")
+        return True, matched_pts_curr, matched_pts_past
+
+    def should_store_keyframe(self, current_gps: np.ndarray) -> bool:
+        if len(self.keyframe_db) == 0:
+            return True
+        last_gps = self.keyframe_db[-1]["gps"]
+        return bool(np.linalg.norm(current_gps - last_gps) > self.min_keyframe_distance)
 
     def image_callback(self, msg: Image):
         gray = self.ros_image_to_gray(msg)
@@ -151,23 +397,47 @@ class MatchPoints(Node):
             return
 
         # track with lk optical flow
-        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(  # ty: ignore
             self.prev_gray, gray, self.prev_pts, None, **self.lk_params
         )
 
         good_mask = status.ravel() == 1
-        pts0 = self.prev_pts[good_mask].reshape(-1, 2)
+        pts0 = self.prev_pts[good_mask].reshape(-1, 2)  # ty: ignore
         pts1 = curr_pts[good_mask].reshape(-1, 2)
         track_ids = [tid for tid, ok in zip(self.track_ids, good_mask) if ok]
 
-        # update track lengths
+        # move dead tracks to lost
+        dead_ids = set(self.track_ids) - set(track_ids)
+        for tid in dead_ids:
+            if tid in self.track_descriptors:
+                self.lost_track_descriptors[tid] = self.track_descriptors[tid]
+                self.lost_track_age[tid] = 0
+                del self.track_descriptors[tid]
+
+        # age out lost tracks
+        to_remove = [
+            tid
+            for tid, age in self.lost_track_age.items()
+            if age > self.max_lost_memory
+        ]
+        for tid in to_remove:
+            del self.lost_track_descriptors[tid]
+            del self.lost_track_age[tid]
+        for tid in self.lost_track_age:
+            if tid not in to_remove:
+                self.lost_track_age[tid] += 1
+
+        # update track lengths and descriptors for survivors
         for tid in track_ids:
             self.track_lengths[tid] = self.track_lengths.get(tid, 0) + 1
-
-        # cull dead tracks
         self.track_lengths = {tid: self.track_lengths[tid] for tid in track_ids}
+        self.track_descriptors = {
+            tid: self.track_descriptors[tid]
+            for tid in track_ids
+            if tid in self.track_descriptors
+        }
 
-        # filter mature tracks for publishing
+        # filter mature tracks
         mature_mask = np.array(
             [
                 self.track_lengths.get(tid, 0) >= self.min_track_length
@@ -175,10 +445,26 @@ class MatchPoints(Node):
             ]
         )
 
+        mature_pts0 = None
+        mature_pts1 = None
+        mature_ids = []
+        mature_descs = None
+
         if len(track_ids) > 0 and any(mature_mask):
             mature_pts0 = pts0[mature_mask]
             mature_pts1 = pts1[mature_mask]
             mature_ids = [tid for tid, m in zip(track_ids, mature_mask) if m]
+            mature_descs = (
+                np.stack(
+                    [
+                        self.track_descriptors[tid]
+                        for tid in mature_ids
+                        if tid in self.track_descriptors
+                    ]
+                )
+                if any(tid in self.track_descriptors for tid in mature_ids)
+                else None
+            )
 
             msg_out = MatchedPoints()
             msg_out.header.stamp = self.get_clock().now().to_msg()
@@ -190,6 +476,69 @@ class MatchPoints(Node):
             msg_out.track_ids = mature_ids
             self._matched_points_pub.publish(msg_out)
 
+        # keyframe storage and loop closure
+        # self.get_logger().info(f"self.latest_gps_msg: {self.latest_gps_msg}")
+        # self.get_logger().info(f"self.latest_pose: {self.latest_pose}")
+        # self.get_logger().info(f"mature_pts1: {mature_pts1}")
+        # self.get_logger().info(f"mature_descs: {mature_descs}")
+        if (
+            self.latest_gps_msg is not None
+            and self.latest_pose is not None
+            and mature_pts1 is not None
+            and mature_descs is not None
+        ):
+            if self.ref_sin_lat is None:
+                self.init_reference(
+                    self.latest_gps_msg.latitude_deg,
+                    self.latest_gps_msg.longitude_deg,
+                    self.latest_gps_msg.altitude_msl_m,
+                )
+            north, east = self.project(
+                self.latest_gps_msg.latitude_deg,
+                self.latest_gps_msg.longitude_deg,
+            )
+            down = -(self.latest_gps_msg.altitude_msl_m - self.ref_alt)
+            current_gps = np.array([north, east, down])
+
+            store_keyframe = self.should_store_keyframe(current_gps)
+            if store_keyframe:
+                self.store_keyframe(
+                    keyframe_id=self.count,
+                    gps_msg=self.latest_gps_msg,
+                    pose=self.latest_pose.pose,
+                    descriptors=mature_descs,
+                    pts=mature_pts1,
+                )
+                candidates = self.find_loop_candidates(current_gps)
+                for candidate in candidates:
+                    success, pts_curr, pts_past = self.verify_loop_closure(
+                        desc_curr=mature_descs,
+                        desc_past=candidate["descriptors"],
+                        pts_curr=mature_pts1,
+                        pts_past=candidate["pts"],
+                    )
+                    if success:
+                        lc_msg = LoopClosure()
+                        lc_msg.header.stamp = self.get_clock().now().to_msg()
+                        lc_msg.current_keyframe_id = self.count
+                        lc_msg.loop_keyframe_id = candidate["keyframe_id"]
+                        lc_msg.points0_x = pts_curr[:, 0].tolist()  # ty: ignore
+                        lc_msg.points0_y = pts_curr[:, 1].tolist()  # ty: ignore
+                        lc_msg.points1_x = pts_past[:, 0].tolist()  # ty: ignore
+                        lc_msg.points1_y = pts_past[:, 1].tolist()  # ty: ignore
+                        self._loop_closure_pub.publish(lc_msg)
+                        self.get_logger().info(
+                            f"loop closure found: {lc_msg.current_keyframe_id} -> {lc_msg.loop_keyframe_id}"
+                        )
+                        self.get_logger().info(
+                            f"keyframes stored: {len(self.keyframe_db)}"
+                        )
+                        self.get_logger().info(
+                            f"lost tracks: {len(self.lost_track_descriptors)}, reassociated: ..."
+                        )
+                        break
+
+        # update track history for visualization
         for pt, tid in zip(pts1, track_ids):
             x, y = int(pt[0]), int(pt[1])
             if tid not in self.track_history:
@@ -198,25 +547,32 @@ class MatchPoints(Node):
             if len(self.track_history[tid]) > self.max_history_len:
                 self.track_history[tid].pop(0)
 
-        # cull dead tracks from history
         self.track_history = {
             tid: hist for tid, hist in self.track_history.items() if tid in track_ids
         }
 
-        # draw tracks on current image
+        # draw tracks
         img_curr = self.ros_image_to_numpy(msg).copy()
         for tid, hist in self.track_history.items():
             for i in range(1, len(hist)):
                 cv2.line(img_curr, hist[i - 1], hist[i], (0, 255, 0), 1)
             cv2.circle(img_curr, hist[-1], 3, (0, 0, 255), -1)
-            cv2.putText(img_curr, str(tid), hist[-1], cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
+            cv2.putText(
+                img_curr,
+                str(tid),
+                hist[-1],
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.3,
+                (255, 255, 0),
+                1,
+            )
 
         rr.set_time("frame", sequence=self.frame_count)
         rr.log("camera/tracks", rr.Image(img_curr), static=True)
 
-        self.get_logger().info(
-            f"tracked: {len(track_ids)}, mature: {int(mature_mask.sum()) if len(track_ids) > 0 else 0}, next_id: {self.next_track_id}"
-        )
+        # self.get_logger().info(
+        #     f"tracked: {len(track_ids)}, mature: {int(mature_mask.sum()) if len(track_ids) > 0 else 0}, next_id: {self.next_track_id}"
+        # )
 
         # update state
         self.prev_gray = gray
@@ -226,7 +582,14 @@ class MatchPoints(Node):
         self.frame_count += 1
         self.count += 1
 
-    def camera_info_callback(self, msg: CameraInfo): ...
+    def pose_callback(self, msg: PoseStamped):
+        self.latest_pose = msg
+
+    def gps_callback(self, msg: SensorGps):
+        self.latest_gps_msg = msg
+
+    def magnetometer_callback(self, msg: VehicleMagnetometer):
+        self.latest_mag_msg = msg
 
 
 def main(args=None):
