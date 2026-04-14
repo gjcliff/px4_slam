@@ -24,7 +24,7 @@ class SuperFlow(Node):
     latest_pose: PoseStamped | None = None
     latest_gps_msg: SensorGps | None = None
     latest_mag_msg: VehicleMagnetometer | None = None
-    min_keyframe_distance: float = 2.5
+    min_keyframe_distance: float = 5.0
     min_keyframes: int = 20
     min_separation: float = 2.0
     keyframe_db: list[dict] = []
@@ -109,13 +109,11 @@ class SuperFlow(Node):
         # track_id -> list of (x, y)
         self.track_history: dict[int, list[tuple[int, int]]] = {}
         self.track_id: int = 0
-        self.min_track_length: int = 15
+        self.min_track_length: int = 30
 
         self.latest_image_msg: Image | None = None
         self.frame_count: int = 0
         self.count: int = 0
-
-        self.has_published: bool = False
 
     def ros_image_to_tensor(self, msg: Image) -> torch.Tensor:
         img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
@@ -145,7 +143,7 @@ class SuperFlow(Node):
         img_np = self.ros_image_to_numpy(msg)
         sky_mask = self.get_sky_mask(img_np)
         kps_int = kps.reshape(-1, 2).astype(int)
-# clip to image bounds
+        # clip to image bounds
         kps_int[:, 0] = np.clip(kps_int[:, 0], 0, img_np.shape[1] - 1)
         kps_int[:, 1] = np.clip(kps_int[:, 1], 0, img_np.shape[0] - 1)
         valid = ~sky_mask[kps_int[:, 1], kps_int[:, 0]]
@@ -603,7 +601,7 @@ class SuperFlow(Node):
                 else None
             )
 
-            if self.should_publish_keyframe() or not self.has_published:
+            if self.should_publish_keyframe():
                 msg_out = MatchedPoints()
                 msg_out.header.stamp = self.get_clock().now().to_msg()
                 msg_out.keyframe_id = self.count
@@ -613,8 +611,7 @@ class SuperFlow(Node):
                     msg_out.descriptors = mature_descs.flatten().tolist()
                 msg_out.track_ids = mature_ids
                 self._matched_points_pub.publish(msg_out)
-                self.has_published = True
-                self.update_last_keyframe_pose()
+                self.last_keyframe_pose = self.update_last_keyframe_pose()
 
         # keyframe storage and loop closure
         if (
@@ -737,19 +734,36 @@ class SuperFlow(Node):
 
         # draw tracks
         img_curr = self.ros_image_to_numpy(msg).copy()
-        for tid, hist in self.track_history.items():
-            is_mature = self.track_lengths.get(tid, 0) >= self.min_track_length
-            color = (0, 255, 255) if is_mature else (0, 255, 0)  # yellow vs green
+        # for tid, hist in self.track_history.items():
+        #     is_mature = self.track_lengths.get(tid, 0) >= self.min_track_length
+        #     color = (0, 255, 255) if is_mature else (0, 255, 0)  # yellow vs green
+        #     for i in range(1, len(hist)):
+        #         cv2.line(img_curr, hist[i - 1], hist[i], color, 1)
+        #     cv2.circle(img_curr, hist[-1], 3, (0, 0, 255), -1)
+        #     cv2.putText(
+        #         img_curr,
+        #         str(tid),
+        #         hist[-1],
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.3,
+        #         (255, 255, 0),
+        #         1,
+        #     )
+        debug_tid = 0  # match whatever track id backend is tracking
+        if debug_tid in self.track_history:
+            hist = self.track_history[debug_tid]
+            # draw a big circle on the current position
+            cv2.circle(img_curr, hist[-1], 10, (255, 0, 255), 2)  # magenta ring
+            # draw the full history in magenta
             for i in range(1, len(hist)):
-                cv2.line(img_curr, hist[i - 1], hist[i], color, 1)
-            cv2.circle(img_curr, hist[-1], 3, (0, 0, 255), -1)
+                cv2.line(img_curr, hist[i - 1], hist[i], (255, 0, 255), 2)
             cv2.putText(
                 img_curr,
-                str(tid),
-                hist[-1],
+                f"DEBUG tid={debug_tid}",
+                (hist[-1][0] + 12, hist[-1][1]),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.3,
-                (255, 255, 0),
+                0.5,
+                (255, 0, 255),
                 1,
             )
 

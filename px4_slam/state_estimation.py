@@ -196,17 +196,17 @@ class StateEstimation(Node):
         q = pose.rotation().toQuaternion()
         rr.set_time("keyframe", sequence=self.count)
         rr.log(
-            "world/drone",
+            "world/state_estimate",
             rr.Transform3D(
                 translation=[t[0], t[1], t[2]],
                 rotation=rr.Quaternion(xyzw=[q.x(), q.y(), q.z(), q.w()]),
             ),
         )
-        rr.log("world/drone/axes", rr.TransformAxes3D(axis_length=1.0), static=True)
+        rr.log("world/state_estimate/axes", rr.TransformAxes3D(axis_length=1.0), static=True)
         # accumulate and redraw the full path
         self.trajectory.append([t[0], t[1], t[2]])
         rr.log(
-            "world/trajectory",
+            "world/state_estimate/trajectory",
             rr.LineStrips3D([self.trajectory], colors=[[0, 200, 255]]),
         )
 

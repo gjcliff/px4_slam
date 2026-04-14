@@ -10,13 +10,13 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
-            Node(
-                package="px4_slam",
-                namespace="",
-                executable="state_estimation",
-                name="backend",
-                parameters = [{"recording_id": recording_id}]
-            ),
+            # Node(
+            #     package="px4_slam",
+            #     namespace="",
+            #     executable="state_estimation",
+            #     name="backend",
+            #     parameters = [{"recording_id": recording_id}]
+            # ),
             Node(
                 package="px4_slam",
                 namespace="",
