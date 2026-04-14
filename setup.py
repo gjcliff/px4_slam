@@ -27,7 +27,8 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "gtsam = px4_slam.gtsam:main",
+            "state_estimation = px4_slam.state_estimation:main",
+            "backend = px4_slam.backend:main",
             "super_flow = px4_slam.super_flow:main",
             "square_flier = px4_slam.square_flier:main",
         ],

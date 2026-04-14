@@ -13,8 +13,15 @@ def generate_launch_description():
             Node(
                 package="px4_slam",
                 namespace="",
-                executable="gtsam",
-                name="state_estimation",
+                executable="state_estimation",
+                name="backend",
+                parameters = [{"recording_id": recording_id}]
+            ),
+            Node(
+                package="px4_slam",
+                namespace="",
+                executable="backend",
+                name="backend",
                 parameters = [{"recording_id": recording_id}]
             ),
             Node(

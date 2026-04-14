@@ -7,20 +7,18 @@ import rerun as rr
 from geometry_msgs.msg import PoseStamped
 from gtsam.symbol_shorthand import B, V, X
 from px4_msgs.msg import SensorCombined, SensorGps, VehicleMagnetometer
-from px4_slam_interfaces.msg import MatchedPoints
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo
 
 
-class PX4Slam(Node):
+class StateEstimation(Node):
     biasKey: int
     biasNoise: gtsam.noiseModel.Isotropic
     pim: gtsam.PreintegratedImuMeasurements
     latest_gps_msg: SensorGps | None = None
     trajectory: list[list[float]] = []
     latest_mag_msg: VehicleMagnetometer | None = None
-    latest_matched_points: MatchedPoints | None = None
     latest_camera_info_msg: CameraInfo | None = None
     ref_sin_lat: float | None = None
     ref_cos_lat: float | None = None
@@ -29,9 +27,6 @@ class PX4Slam(Node):
     ref_alt: float | None = None
     prev_timestamp: int | None = None
     count: int = 0
-
-    K: gtsam.Cal3_S2 | None = None
-    pixelNoise: gtsam.noiseModel.Isotropic | None = None
 
     def __init__(self):
         super().__init__("px4_slam")
@@ -61,18 +56,6 @@ class PX4Slam(Node):
             VehicleMagnetometer,
             "fmu/out/vehicle_magnetometer",
             self.magnetometer_callback,
-            qos_profile=qos_profile_sensor_data,
-        )
-        self._matched_points_sub: rclpy.node.Subscription = self.create_subscription(
-            MatchedPoints,
-            "camera/matched_points",
-            self.matched_points_callback,
-            qos_profile=qos_profile_sensor_data,
-        )
-        self._camera_info_sub: rclpy.node.Subscription = self.create_subscription(
-            CameraInfo,
-            "camera/camera_info",
-            self.camera_info_callback,
             qos_profile=qos_profile_sensor_data,
         )
 
@@ -301,26 +284,14 @@ class PX4Slam(Node):
     def magnetometer_callback(self, msg: VehicleMagnetometer):
         self.latest_mag_msg = msg
 
-    def matched_points_callback(self, msg: MatchedPoints): ...
-
-    def camera_info_callback(self, msg: CameraInfo):
-        if self.K is None:
-            self.K = gtsam.Cal3_S2(
-                msg.k[0],  # fx
-                msg.k[4],  # fy
-                msg.k[1],  # s (skew)
-                msg.k[2],  # u0 (cx)
-                msg.k[5],  # v0 (cy)
-            )
-
 
 def main(args=None):
     rclpy.init(args=args)
 
-    px4_slam = PX4Slam()
-    rclpy.spin(px4_slam)
+    state_estimation = StateEstimation()
+    rclpy.spin(state_estimation)
 
-    px4_slam.destroy_node()
+    state_estimation.destroy_node()
     rclpy.shutdown()
 
 

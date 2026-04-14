@@ -34,6 +34,10 @@ class SuperFlow(Node):
     ref_lon: float | None = None
     ref_alt: float | None = None
 
+    last_keyframe_pose: np.ndarray | None = None
+    keyframe_translation_threshold: float = 1.0
+    keyframe_rotation_threshold: float = np.radians(20)
+
     def __init__(self):
         super().__init__("super_flow")
 
@@ -43,7 +47,7 @@ class SuperFlow(Node):
         )
 
         rr.init("super_flow", recording_id=recording_id)
-        rr.connect_grpc()
+        rr.spawn()
 
         self._matched_points_pub: rclpy.node.Publisher = self.create_publisher(
             MatchedPoints, "camera/matched_points", qos_profile_sensor_data
@@ -74,7 +78,7 @@ class SuperFlow(Node):
         )
 
         # superpoint for detection only, no matcher needed
-        self.extractor = (
+        self.extractor: SuperPoint = (
             SuperPoint(max_num_keypoints=128, detection_threshold=0.005, nms_radius=4)
             .eval()
             .cuda()
@@ -90,7 +94,7 @@ class SuperFlow(Node):
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
         )
 
-        self.redetect_every: int = 20  # redetect with superpoint every N frames
+        self.redetect_every: int = 118  # redetect with superpoint every N frames
 
         # track state
         self.prev_gray: np.ndarray | None = None
@@ -104,12 +108,14 @@ class SuperFlow(Node):
         self.lost_track_age: dict[int, int] = {}  # track_id -> frames since lost
         # track_id -> list of (x, y)
         self.track_history: dict[int, list[tuple[int, int]]] = {}
-        self.next_track_id: int = 0
-        self.min_track_length: int = 3
+        self.track_id: int = 0
+        self.min_track_length: int = 15
 
         self.latest_image_msg: Image | None = None
         self.frame_count: int = 0
         self.count: int = 0
+
+        self.has_published: bool = False
 
     def ros_image_to_tensor(self, msg: Image) -> torch.Tensor:
         img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
@@ -135,6 +141,17 @@ class SuperFlow(Node):
         feats = self.extractor.extract(gpu_img)
         kps = feats["keypoints"][0].cpu().numpy()  # (N, 2)
         desc = feats["descriptors"][0].cpu().numpy()  # (N, 256)
+
+        img_np = self.ros_image_to_numpy(msg)
+        sky_mask = self.get_sky_mask(img_np)
+        kps_int = kps.reshape(-1, 2).astype(int)
+# clip to image bounds
+        kps_int[:, 0] = np.clip(kps_int[:, 0], 0, img_np.shape[1] - 1)
+        kps_int[:, 1] = np.clip(kps_int[:, 1], 0, img_np.shape[0] - 1)
+        valid = ~sky_mask[kps_int[:, 1], kps_int[:, 0]]
+        kps = kps[valid]
+        desc = desc[valid]
+
         return kps.reshape(-1, 1, 2).astype(np.float32), desc
 
     def draw_track_ids(
@@ -152,8 +169,8 @@ class SuperFlow(Node):
         new_pts, new_descs = self.detect_with_superpoint(msg)
 
         if self.prev_pts is None or len(self.prev_pts) == 0:
-            new_ids = list(range(self.next_track_id, self.next_track_id + len(new_pts)))
-            self.next_track_id += len(new_pts)
+            new_ids = list(range(self.track_id, self.track_id + len(new_pts)))
+            self.track_id += len(new_pts)
             for tid, desc in zip(new_ids, new_descs):
                 self.track_lengths[tid] = 1
                 self.track_descriptors[tid] = desc
@@ -177,8 +194,8 @@ class SuperFlow(Node):
             if dists.min() > 10:
                 tid = self.match_lost_track(desc)
                 if tid is None:
-                    tid = self.next_track_id
-                    self.next_track_id += 1
+                    tid = self.track_id
+                    self.track_id += 1
                     new_count += 1
                 else:
                     reassociated_count += 1
@@ -442,6 +459,57 @@ class SuperFlow(Node):
         last_gps = self.keyframe_db[-1]["ned_pos"]
         return bool(np.linalg.norm(current_gps - last_gps) > self.min_keyframe_distance)
 
+    def should_publish_keyframe(self) -> bool:
+        if self.last_keyframe_pose is None:
+            self.last_keyframe_pose = self.update_last_keyframe_pose()
+            return False
+        if self.latest_pose is None:
+            return False
+        pos = self.position_from_pose(self.latest_pose.pose)
+        translation = np.linalg.norm(pos - self.last_keyframe_pose[:3])
+        if translation >= self.keyframe_translation_threshold:
+            return True
+        # rotation check using quaternion dot product
+        q = self.latest_pose.pose.orientation
+        q_last = self.last_keyframe_pose[3:]
+        dot = abs(q.w * q_last[3] + q.x * q_last[0] + q.y * q_last[1] + q.z * q_last[2])
+        dot = np.clip(dot, 0.0, 1.0)
+        angle = 2.0 * np.arccos(dot)
+        return angle >= self.keyframe_rotation_threshold
+
+    def update_last_keyframe_pose(self) -> np.ndarray | None:
+        if self.latest_pose is None:
+            return
+        q = self.latest_pose.pose.orientation
+        pos = self.position_from_pose(self.latest_pose.pose)
+        # store as [x, y, z, qx, qy, qz, qw]
+        return np.array([pos[0], pos[1], pos[2], q.x, q.y, q.z, q.w])
+
+    def get_sky_mask(self, img: np.ndarray) -> np.ndarray:
+        # img is RGB
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        # sky: hue around blue (100-130), low-ish saturation, high value
+        sky_pixels = (
+            (hsv[:, :, 0] >= 90)
+            & (hsv[:, :, 0] <= 140)
+            & (hsv[:, :, 1] < 100)
+            & (hsv[:, :, 2] > 150)
+        )
+        # also catch white/grey overcast sky
+        overcast = (hsv[:, :, 1] < 30) & (hsv[:, :, 2] > 200)
+        sky_pixels = sky_pixels | overcast
+
+        # connected components — only keep large regions
+        sky_uint8 = sky_pixels.astype(np.uint8) * 255
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky_uint8)
+        min_area = img.shape[0] * img.shape[1] * 0.01  # at least 1% of image
+        sky_mask = np.zeros_like(sky_pixels)
+        for label in range(1, num_labels):  # skip background label 0
+            if stats[label, cv2.CC_STAT_AREA] >= min_area:
+                sky_mask |= labels == label
+
+        return sky_mask
+
     def image_callback(self, msg: Image):
         gray = self.ros_image_to_gray(msg)
 
@@ -475,7 +543,6 @@ class SuperFlow(Node):
             return
 
         good_mask = status.ravel() == 1
-        pts0 = self.prev_pts[good_mask].reshape(-1, 2)
         pts1 = curr_pts[good_mask].reshape(-1, 2)
         track_ids = [tid for tid, ok in zip(self.track_ids, good_mask) if ok]
 
@@ -518,13 +585,10 @@ class SuperFlow(Node):
             ]
         )
 
-        mature_pts0 = None
         mature_pts1 = None
-        mature_ids = []
         mature_descs = None
 
         if len(track_ids) > 0 and any(mature_mask):
-            mature_pts0 = pts0[mature_mask]
             mature_pts1 = pts1[mature_mask]
             mature_ids = [tid for tid, m in zip(track_ids, mature_mask) if m]
             mature_descs = (
@@ -539,25 +603,20 @@ class SuperFlow(Node):
                 else None
             )
 
-            msg_out = MatchedPoints()
-            msg_out.header.stamp = self.get_clock().now().to_msg()
-            msg_out.keyframe_id = self.count
-            msg_out.points_x = mature_pts1[:, 0].tolist()
-            msg_out.points_y = mature_pts1[:, 1].tolist()
-            if mature_descs is not None:
-                msg_out.descriptors = mature_descs.flatten().tolist()
-            # msg_out.points0_x = mature_pts0[:, 0].tolist()
-            # msg_out.points0_y = mature_pts0[:, 1].tolist()
-            # msg_out.points1_x = mature_pts1[:, 0].tolist()
-            # msg_out.points1_y = mature_pts1[:, 1].tolist()
-            msg_out.track_ids = mature_ids
-            self._matched_points_pub.publish(msg_out)
+            if self.should_publish_keyframe() or not self.has_published:
+                msg_out = MatchedPoints()
+                msg_out.header.stamp = self.get_clock().now().to_msg()
+                msg_out.keyframe_id = self.count
+                msg_out.points_x = mature_pts1[:, 0].tolist()
+                msg_out.points_y = mature_pts1[:, 1].tolist()
+                if mature_descs is not None:
+                    msg_out.descriptors = mature_descs.flatten().tolist()
+                msg_out.track_ids = mature_ids
+                self._matched_points_pub.publish(msg_out)
+                self.has_published = True
+                self.update_last_keyframe_pose()
 
         # keyframe storage and loop closure
-        # self.get_logger().info(f"self.latest_gps_msg: {self.latest_gps_msg}")
-        # self.get_logger().info(f"self.latest_pose: {self.latest_pose}")
-        # self.get_logger().info(f"mature_pts1: {mature_pts1}")
-        # self.get_logger().info(f"mature_descs: {mature_descs}")
         if (
             self.latest_gps_msg is not None
             and self.latest_pose is not None
@@ -679,8 +738,10 @@ class SuperFlow(Node):
         # draw tracks
         img_curr = self.ros_image_to_numpy(msg).copy()
         for tid, hist in self.track_history.items():
+            is_mature = self.track_lengths.get(tid, 0) >= self.min_track_length
+            color = (0, 255, 255) if is_mature else (0, 255, 0)  # yellow vs green
             for i in range(1, len(hist)):
-                cv2.line(img_curr, hist[i - 1], hist[i], (0, 255, 0), 1)
+                cv2.line(img_curr, hist[i - 1], hist[i], color, 1)
             cv2.circle(img_curr, hist[-1], 3, (0, 0, 255), -1)
             cv2.putText(
                 img_curr,
@@ -694,10 +755,6 @@ class SuperFlow(Node):
 
         rr.set_time("keyframe", sequence=self.frame_count)
         rr.log("camera/tracks", rr.Image(img_curr), static=True)
-
-        # self.get_logger().info(
-        #     f"tracked: {len(track_ids)}, mature: {int(mature_mask.sum()) if len(track_ids) > 0 else 0}, next_id: {self.next_track_id}"
-        # )
 
         # update state
         self.prev_gray = gray
